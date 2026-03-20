@@ -5,30 +5,7 @@ use std::fmt;
 use crate::autograd::graph::Graph;
 use crate::autograd::node::{Node, Operation};
 
-pub struct TensorStore {
-    tensors: Vec<Tensor>,
-}
-
-impl TensorStore {
-    pub fn new() -> Self {
-        Self { tensors: Vec::new() }
-    }
-
-    pub fn add(&mut self, mut tensor: Tensor) -> usize {
-        let id = self.tensors.len();
-        tensor.id = id;
-        self.tensors.push(tensor);
-        id
-    }
-
-    pub fn get(&self, id: usize) -> &Tensor {
-        &self.tensors[id]
-    }
-
-    pub fn get_mut(&mut self, id: usize) -> &mut Tensor {
-        &mut self.tensors[id]
-    }
-}
+use crate::tensor::store::TensorStore;
 
 pub struct Tensor {
     pub id: usize,
@@ -178,3 +155,90 @@ impl Tensor {
         )
     }
 }   
+
+pub fn mul(a_id: usize, b_id: usize, store: &mut TensorStore, graph: &mut Graph) -> usize {
+    let a = store.get(a_id);
+    let b = store.get(b_id);
+
+    assert_eq!(a.shape, b.shape, "Shapes must be the same for multiplication");
+
+    let result_data: Vec<f32> = a
+        .data
+        .iter()
+        .zip(b.data.iter())
+        .map(|(x, y)| x * y)
+        .collect();
+
+    let requires_grad = a.requires_grad || b.requires_grad;
+
+    let result_tensor = Tensor {
+        id: 0, // will be set by TensorStore::add
+        data: result_data,
+        grad: vec![0.0; a.data.len()],
+        shape: a.shape.clone(),
+        requires_grad,
+        creator: None,
+    };
+
+    let out_id = store.add(result_tensor);
+
+    let node = Node {
+        inputs: vec![a_id, b_id],
+        output: out_id,
+        op: Operation::Mul,
+    };
+
+    let node_id = graph.nodes.len();
+    graph.add_node(node);
+
+    store.get_mut(out_id).creator = Some(node_id);
+
+    out_id
+}
+
+pub fn matmul(a_id: usize, b_id: usize, store: &mut TensorStore, graph: &mut Graph) -> usize {
+    let a = store.get(a_id);
+    let b = store.get(b_id);
+
+    assert_eq!(a.shape.len(), 2, "First tensor must be 2D for matmul");
+    assert_eq!(b.shape.len(), 2, "Second tensor must be 2D for matmul");
+    assert_eq!(a.shape[1], b.shape[0], "Inner dimensions must match for matmul");
+
+    let (m, n) = (a.shape[0], a.shape[1]);
+    let p = b.shape[1];
+
+    let mut result_data = vec![0.0; m * p];
+    for i in 0..m {
+        for j in 0..p {
+            let mut sum = 0.0;
+            for k in 0..n {
+                sum += a.data[i * n + k] * b.data[k * p + j];
+            }
+            result_data[i * p + j] = sum;
+        }
+    }
+
+    let requires_grad = a.requires_grad || b.requires_grad;
+    let result_tensor = Tensor {
+        id: 0, // will be set by TensorStore::add
+        data: result_data,
+        grad: vec![0.0; m * p],
+        shape: vec![m, p],
+        requires_grad,
+        creator: None,
+    };
+
+    let out_id = store.add(result_tensor);
+
+    let node = Node {
+        inputs: vec![a_id, b_id],
+        output: out_id,
+        op: Operation::MatMul,
+    };
+
+    let node_id = graph.nodes.len();
+    graph.add_node(node);
+    store.get_mut(out_id).creator = Some(node_id);
+
+    out_id
+}

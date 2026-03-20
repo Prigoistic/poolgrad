@@ -8,7 +8,7 @@ pub struct Node {
 
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub enum Operation {
     Add,
