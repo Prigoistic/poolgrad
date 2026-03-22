@@ -1,0 +1,26 @@
+# Rust
+/target/
+
+# Cargo (uncomment if you do NOT want to commit lockfiles)
+# Cargo.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor/IDE
+.vscode/
+.idea/
+*.iml
+
+# Vim/Emacs
+*~
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Misc
+**/*.rs.bk
