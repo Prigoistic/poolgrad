@@ -1,7 +1,7 @@
 use crate::tensor::tensor::Tensor;
 
 pub struct TensorStore {
-    tensors: Vec<Tensor>,
+    pub tensors: Vec<Tensor>,
 }
 
 impl TensorStore {

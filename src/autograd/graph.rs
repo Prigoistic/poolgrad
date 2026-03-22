@@ -131,6 +131,55 @@ impl Graph {
                         }
                     }
                 }
+
+                Operation::ReLU => {
+                    let out_grad = store.get(node.output).grad.clone();
+                    let input_id = node.inputs[0];
+
+                    let input_data = store.get(input_id).data.clone();
+                    let input = store.get_mut(input_id);
+
+                    for i in 0..out_grad.len() {
+                        let grad = if input_data[i] > 0.0 { 1.0 } else { 0.0 };
+                        input.grad[i] += grad * out_grad[i];
+                    }
+                }
+
+                Operation::MSE => {
+                    // loss = mean((pred - target)^2)
+                    // dloss/dpred = (2/N) * (pred - target) * upstream
+                    // dloss/dtarget = -(2/N) * (pred - target) * upstream
+                    let out_grad = store.get(node.output).grad.clone();
+                    let upstream = out_grad[0];
+
+                    let pred_id = node.inputs[0];
+                    let target_id = node.inputs[1];
+
+                    let pred_data = store.get(pred_id).data.clone();
+                    let target_data = store.get(target_id).data.clone();
+
+                    assert_eq!(
+                        pred_data.len(),
+                        target_data.len(),
+                        "MSE backward: pred and target must have same length"
+                    );
+
+                    let n = pred_data.len() as f32;
+                    let scale = 2.0 / n;
+
+                    if pred_id == target_id {
+                        // (pred - pred) == 0, gradients are zero
+                    } else {
+                        let (pred, target) = store.get2_mut(pred_id, target_id);
+                        for i in 0..pred_data.len() {
+                            let diff = pred_data[i] - target_data[i];
+                            let g = scale * diff * upstream;
+                            pred.grad[i] += g;
+                            target.grad[i] -= g;
+                        }
+                    }
+                }
+                
             }
         }
     }
@@ -141,7 +190,7 @@ impl Graph {
 mod tests {
     use super::Graph;
     use crate::tensor::store::TensorStore;
-    use crate::tensor::tensor::{matmul, Tensor};
+    use crate::tensor::tensor::{matmul, relu, Tensor};
 
     #[test]
     fn matmul_backward_matches_sums_when_loss_grad_is_ones() {
@@ -163,4 +212,20 @@ mod tests {
         assert_eq!(store.get(a_id).grad, expected_a_grad);
         assert_eq!(store.get(b_id).grad, expected_b_grad);
     }
+
+    #[test]
+    fn relu_backward_masks_non_positive_inputs() {
+        let mut store = TensorStore::new();
+        let mut graph = Graph::new();
+
+        let x_id = store.add(Tensor::new(vec![-1.0, 2.0, 0.5, 0.0], vec![4], true));
+        let y_id = relu(x_id, &mut store, &mut graph);
+
+        graph.backward(&mut store, y_id);
+
+        // dy/dx is 0 for x<=0, 1 for x>0 (with upstream grad = 1)
+        assert_eq!(store.get(x_id).grad, vec![0.0, 1.0, 1.0, 0.0]);
+    }
+
+    
 }

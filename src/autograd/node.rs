@@ -14,4 +14,6 @@ pub enum Operation {
     Add,
     Mul,
     MatMul,
+    ReLU,
+    MSE,
 }

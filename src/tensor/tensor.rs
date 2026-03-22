@@ -242,3 +242,30 @@ pub fn matmul(a_id: usize, b_id: usize, store: &mut TensorStore, graph: &mut Gra
 
     out_id
 }
+
+pub fn relu(input_id: usize, store: &mut TensorStore, graph: &mut Graph) -> usize {
+    let input = store.get(input_id);
+
+    let result_data: Vec<f32> = input
+        .data
+        .iter()
+        .map(|x| if *x > 0.0 { *x } else { 0.0 })
+        .collect();
+
+    let result = Tensor::new(result_data, input.shape.clone(), input.requires_grad);
+
+    let out_id = store.add(result);
+
+    let node = Node {
+        inputs: vec![input_id],
+        output: out_id,
+        op: Operation::ReLU,
+    };
+
+    let node_id = graph.nodes.len();
+    graph.add_node(node);
+
+    store.get_mut(out_id).creator = Some(node_id);
+
+    out_id
+}
