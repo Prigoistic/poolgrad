@@ -1,12 +1,14 @@
 mod autograd;
 mod tensor;
 mod nn;
+mod plannar;
 
 use autograd::graph::Graph;
 use tensor::store::TensorStore;
 use tensor::tensor::Tensor;
 use nn::linear::Linear;
 use nn::loss::mse;
+use plannar::lifetime::compute_lifetimes;
 fn main() {
     let mut store = TensorStore::new();
     let mut graph = Graph::new();
@@ -37,7 +39,20 @@ fn main() {
             bias.data[i] -= lr * bias.grad[i];
         }
 
-        println!("Epoch {} Loss: {:?}", epoch, store.get(loss_id).data);
+        println!(
+            "Epoch {} Loss: {:?}, Output: {:?}",
+            epoch,
+            store.get(loss_id).data,
+            store.get(out_id).data
+        );
+
+        if epoch == 9 {
+            let lifetimes = compute_lifetimes(&graph);
+
+            for (id, lt) in lifetimes.iter() {
+                println!("Tensor {}: birth={}, death={}", id, lt.birth, lt.death);
+            }
+        }
 
         // reset graph + grads (IMPORTANT)
         graph.nodes.clear();
