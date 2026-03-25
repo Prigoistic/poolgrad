@@ -2,6 +2,7 @@
 
 use crate::autograd::graph::Graph;
 use crate::autograd::node::{Node, Operation};
+use crate::mem::pool::MemoryPool;
 use crate::tensor::store::TensorStore;
 use crate::tensor::tensor::Tensor;
 
@@ -10,6 +11,7 @@ pub fn mse(
     target_id: usize,
     store: &mut TensorStore,
     graph: &mut Graph,
+    pool: &mut MemoryPool,
 ) -> usize {
     let pred = store.get(pred_id);
     let target = store.get(target_id);
@@ -29,7 +31,7 @@ pub fn mse(
 
     let mean = diff_data.iter().sum::<f32>() / diff_data.len() as f32;
 
-    let loss = Tensor::new(vec![mean], vec![1], true);
+    let loss = Tensor::new_with_pool(vec![mean], vec![1], true, pool);
 
     let loss_id = store.add(loss);
 

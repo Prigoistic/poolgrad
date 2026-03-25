@@ -6,6 +6,7 @@ use crate::autograd::graph::Graph;
 use crate::autograd::node::{Node, Operation};
 
 use crate::tensor::store::TensorStore;
+use crate::mem::pool::MemoryPool;
 
 pub struct Tensor {
     pub id: usize,
@@ -39,6 +40,28 @@ impl Tensor {
         assert_eq!(data.len(), size, "Shape does not match data length");
 
         let grad = vec![0.0; size];
+
+        Self {
+            id: 0,
+            data,
+            grad,
+            shape,
+            requires_grad,
+            creator: None,
+        }
+    }
+
+    pub fn new_with_pool(
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        requires_grad: bool,
+        pool: &mut MemoryPool,
+    ) -> Self {
+        let size: usize = shape.iter().product();
+
+        assert_eq!(data.len(), size, "Shape does not match data length");
+
+        let grad = pool.get(size);
 
         Self {
             id: 0,
