@@ -3,7 +3,8 @@
 //y=mx+c this is the linear layer defination by changing the weights and bias we can change the line and fit it to the data
 use crate::tensor::store::TensorStore;
 use crate::autograd::graph::Graph;
-use crate::tensor::tensor::{matmul, Tensor};
+use crate::mem::pool::MemoryPool;
+use crate::tensor::tensor::{matmul_scheduled_with_pool, Tensor};
 
 pub struct Linear {
     pub weight_id: usize,
@@ -38,10 +39,16 @@ impl Linear {
 }
 
 impl Linear {
-    pub fn forward(&self, input_id: usize, store: &mut TensorStore, graph: &mut Graph) -> usize {
+    pub fn forward(
+        &self,
+        input_id: usize,
+        store: &mut TensorStore,
+        graph: &mut Graph,
+        pool: &mut MemoryPool,
+    ) -> usize {
         // ADDING x @ w
-        let matmul_out = matmul(input_id, self.weight_id, store, graph);
+        let matmul_out = matmul_scheduled_with_pool(input_id, self.weight_id, store, graph, pool);
         
-        Tensor::add(matmul_out, self.bias_id, store, graph)
+        Tensor::add_with_pool(matmul_out, self.bias_id, store, graph, pool)
     }
 }

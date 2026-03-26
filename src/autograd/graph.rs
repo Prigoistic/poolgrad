@@ -25,8 +25,10 @@ impl Graph {
         // Step 1: initialize d(loss)/d(loss) = 1
         {
             let loss = store.get_mut(loss_id); 
-            for g in loss.grad.iter_mut() {
-                *g = 1.0;
+            if loss.requires_grad {
+                for g in loss.grad.iter_mut() {
+                    *g = 1.0;
+                }
             }
         }
 
@@ -39,16 +41,25 @@ impl Graph {
                     let a_id = node.inputs[0];
                     let b_id = node.inputs[1];
 
+                    let a_req = store.get(a_id).requires_grad;
+                    let b_req = store.get(b_id).requires_grad;
+
                     if a_id == b_id {
-                        let a = store.get_mut(a_id);
-                        for i in 0..out_grad.len() {
-                            a.grad[i] += 2.0 * out_grad[i];
+                        if a_req {
+                            let a = store.get_mut(a_id);
+                            for i in 0..out_grad.len() {
+                                a.grad[i] += 2.0 * out_grad[i];
+                            }
                         }
                     } else {
                         let (a, b) = store.get2_mut(a_id, b_id);
                         for i in 0..out_grad.len() {
-                            a.grad[i] += out_grad[i];
-                            b.grad[i] += out_grad[i];
+                            if a_req {
+                                a.grad[i] += out_grad[i];
+                            }
+                            if b_req {
+                                b.grad[i] += out_grad[i];
+                            }
                         }
                     }
                 }
@@ -62,17 +73,26 @@ impl Graph {
                     let a_data = store.get(a_id).data.clone();
                     let b_data = store.get(b_id).data.clone();
 
+                    let a_req = store.get(a_id).requires_grad;
+                    let b_req = store.get(b_id).requires_grad;
+
                     if a_id == b_id {
                         // y = a * a => dy/da = 2a
-                        let a = store.get_mut(a_id);
-                        for i in 0..out_grad.len() {
-                            a.grad[i] += 2.0 * a_data[i] * out_grad[i];
+                        if a_req {
+                            let a = store.get_mut(a_id);
+                            for i in 0..out_grad.len() {
+                                a.grad[i] += 2.0 * a_data[i] * out_grad[i];
+                            }
                         }
                     } else {
                         let (a, b) = store.get2_mut(a_id, b_id);
                         for i in 0..out_grad.len() {
-                            a.grad[i] += b_data[i] * out_grad[i];
-                            b.grad[i] += a_data[i] * out_grad[i];
+                            if a_req {
+                                a.grad[i] += b_data[i] * out_grad[i];
+                            }
+                            if b_req {
+                                b.grad[i] += a_data[i] * out_grad[i];
+                            }
                         }
                     }
                 }
@@ -98,6 +118,13 @@ impl Graph {
                     let a_data = store.get(a_id).data.clone();
                     let b_data = store.get(b_id).data.clone();
 
+                    let a_req = store.get(a_id).requires_grad;
+                    let b_req = store.get(b_id).requires_grad;
+
+                    if !a_req && !b_req {
+                        continue;
+                    }
+
                     // dA = dC @ B^T, dB = A^T @ dC
                     let mut d_a = vec![0.0f32; m * n];
                     let mut d_b = vec![0.0f32; n * p];
@@ -114,20 +141,26 @@ impl Graph {
 
                     if a_id == b_id {
                         // Only valid for square A (m==n==p) in practice; we still accumulate safely.
-                        let a = store.get_mut(a_id);
-                        for idx in 0..a.grad.len() {
-                            a.grad[idx] += d_a[idx];
-                            if idx < d_b.len() {
-                                a.grad[idx] += d_b[idx];
+                        if a_req {
+                            let a = store.get_mut(a_id);
+                            for idx in 0..a.grad.len() {
+                                a.grad[idx] += d_a[idx];
+                                if b_req && idx < d_b.len() {
+                                    a.grad[idx] += d_b[idx];
+                                }
                             }
                         }
                     } else {
                         let (a, b) = store.get2_mut(a_id, b_id);
-                        for idx in 0..d_a.len() {
-                            a.grad[idx] += d_a[idx];
+                        if a_req {
+                            for idx in 0..d_a.len() {
+                                a.grad[idx] += d_a[idx];
+                            }
                         }
-                        for idx in 0..d_b.len() {
-                            b.grad[idx] += d_b[idx];
+                        if b_req {
+                            for idx in 0..d_b.len() {
+                                b.grad[idx] += d_b[idx];
+                            }
                         }
                     }
                 }
@@ -135,6 +168,10 @@ impl Graph {
                 Operation::ReLU => {
                     let out_grad = store.get(node.output).grad.clone();
                     let input_id = node.inputs[0];
+
+                    if !store.get(input_id).requires_grad {
+                        continue;
+                    }
 
                     let input_data = store.get(input_id).data.clone();
                     let input = store.get_mut(input_id);
@@ -155,6 +192,9 @@ impl Graph {
                     let pred_id = node.inputs[0];
                     let target_id = node.inputs[1];
 
+                    let pred_req = store.get(pred_id).requires_grad;
+                    let target_req = store.get(target_id).requires_grad;
+
                     let pred_data = store.get(pred_id).data.clone();
                     let target_data = store.get(target_id).data.clone();
 
@@ -174,8 +214,12 @@ impl Graph {
                         for i in 0..pred_data.len() {
                             let diff = pred_data[i] - target_data[i];
                             let g = scale * diff * upstream;
-                            pred.grad[i] += g;
-                            target.grad[i] -= g;
+                            if pred_req {
+                                pred.grad[i] += g;
+                            }
+                            if target_req {
+                                target.grad[i] -= g;
+                            }
                         }
                     }
                 }
