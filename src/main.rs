@@ -64,35 +64,7 @@ fn run_training(config: &Config) -> MemoryPool {
             );
         }
 
-        // planner + pool: free intermediate grad buffers at their death step
-        let lifetimes = compute_lifetimes(&graph);
-
-        if config.verbose && epoch == 9 {
-            for (id, lt) in lifetimes.iter() {
-                println!("Tensor {}: birth={}, death={}", id, lt.birth, lt.death);
-            }
-        }
-
-        // Bucket tensors by death step to avoid scanning all lifetimes each step.
-        let mut death_buckets: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
-        for (tensor_id, lifetime) in lifetimes.iter() {
-            if lifetime.death < death_buckets.len() {
-                let tensor_id = *tensor_id;
-                // Only release intermediate tensors (creator set). Persistent tensors like params/inputs keep grads.
-                if store.get(tensor_id).creator.is_some() {
-                    death_buckets[lifetime.death].push(tensor_id);
-                }
-            }
-        }
-
-        for (step, _node) in graph.nodes.iter().enumerate() {
-            for &tensor_id in &death_buckets[step] {
-                let tensor = store.get_mut(tensor_id);
-                if !tensor.grad.is_empty() {
-                    pool.release(std::mem::take(&mut tensor.grad));
-                }
-            }
-        }
+        release_intermediate_grads(&mut store, &graph, &mut pool, config.verbose && epoch == 9);
 
         // reset graph + grads (IMPORTANT)
         graph.nodes.clear();
@@ -102,6 +74,43 @@ fn run_training(config: &Config) -> MemoryPool {
     }
 
     pool
+}
+
+fn release_intermediate_grads(
+    store: &mut TensorStore,
+    graph: &Graph,
+    pool: &mut MemoryPool,
+    verbose: bool,
+) {
+    // planner + pool: free intermediate grad buffers at their death step
+    let lifetimes = compute_lifetimes(graph);
+
+    if verbose {
+        for (id, lt) in lifetimes.iter() {
+            println!("Tensor {}: birth={}, death={}", id, lt.birth, lt.death);
+        }
+    }
+
+    // Bucket tensors by death step to avoid scanning all lifetimes each step.
+    let mut death_buckets: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
+    for (tensor_id, lifetime) in lifetimes.iter() {
+        if lifetime.death < death_buckets.len() {
+            let tensor_id = *tensor_id;
+            // Only release intermediate tensors (creator set). Persistent tensors like params/inputs keep grads.
+            if store.get(tensor_id).creator.is_some() {
+                death_buckets[lifetime.death].push(tensor_id);
+            }
+        }
+    }
+
+    for (step, _node) in graph.nodes.iter().enumerate() {
+        for &tensor_id in &death_buckets[step] {
+            let tensor = store.get_mut(tensor_id);
+            if !tensor.grad.is_empty() {
+                pool.release(std::mem::take(&mut tensor.grad));
+            }
+        }
+    }
 }
 
 fn print_metrics(label: &str, pool: &MemoryPool) {
@@ -321,6 +330,82 @@ fn run_kernel_benchmark() {
     }
 }
 
+fn run_forward_backward_step_benchmark() {
+    use tensor::tensor::matmul_scheduled_with_pool;
+
+    // Measures a training-style step: forward matmul + backward gradients.
+    let sizes = [64usize, 128, 256];
+
+    let warmup = std::env::var("POOLGRAD_BENCH_WARMUP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2);
+    let trials = std::env::var("POOLGRAD_BENCH_TRIALS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(9);
+
+    println!(
+        "\nForward+Backward step benchmark (warmup={}, trials={})",
+        warmup, trials
+    );
+    println!("Size | Kernel | Step_med | Step_p95 | LivePeak | ResidentPeak");
+    println!("-----|--------|---------|---------|---------|------------");
+
+    for &size in &sizes {
+        let kernel = select_kernel(size);
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
+
+        // Warmup
+        for _ in 0..warmup {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let a_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
+            let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
+            let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
+            graph.backward(&mut store, out_id, &mut pool);
+            release_intermediate_grads(&mut store, &graph, &mut pool, false);
+        }
+
+        // Reset peaks so reported peaks correspond to the measured trials.
+        pool.peak_memory = 0;
+        pool.cached_peak = 0;
+        pool.resident_peak = 0;
+
+        let mut samples = Vec::with_capacity(trials);
+        for _ in 0..trials {
+            let start = Instant::now();
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+
+            let a_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
+            let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
+
+            let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
+            graph.backward(&mut store, out_id, &mut pool);
+            release_intermediate_grads(&mut store, &graph, &mut pool, false);
+
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = samples[samples.len() / 2];
+        let p95_idx = ((samples.len() * 95 + 99) / 100).saturating_sub(1).min(samples.len() - 1);
+        let p95 = samples[p95_idx];
+
+        println!(
+            "{:>4} | {:>6?} | {:>7.3} | {:>7.3} | {:>7} | {:>11}",
+            size,
+            kernel,
+            median,
+            p95,
+            pool.peak_memory,
+            pool.resident_peak,
+        );
+    }
+}
+
 fn main() {
     // Ensure reproducible, end-to-end comparable metrics across runs.
     MemoryPool::reset_global_metrics();
@@ -337,6 +422,7 @@ fn main() {
 
     validate_kernels();
     run_kernel_benchmark();
+    run_forward_backward_step_benchmark();
 
     let exp_peak = run_kernel_pool_interaction_experiment();
 
@@ -381,27 +467,7 @@ fn run_kernel_pool_interaction_experiment() -> usize {
 
             let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
             graph.backward(&mut store, out_id, &mut pool);
-
-            // planner + pool: free intermediate grad buffers at their death step
-            let lifetimes = compute_lifetimes(&graph);
-            let mut death_buckets: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
-            for (tensor_id, lifetime) in lifetimes.iter() {
-                if lifetime.death < death_buckets.len() {
-                    let tensor_id = *tensor_id;
-                    if store.get(tensor_id).creator.is_some() {
-                        death_buckets[lifetime.death].push(tensor_id);
-                    }
-                }
-            }
-
-            for (step, _node) in graph.nodes.iter().enumerate() {
-                for &tensor_id in &death_buckets[step] {
-                    let tensor = store.get_mut(tensor_id);
-                    if !tensor.grad.is_empty() {
-                        pool.release(std::mem::take(&mut tensor.grad));
-                    }
-                }
-            }
+            release_intermediate_grads(&mut store, &graph, &mut pool, false);
         }
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
