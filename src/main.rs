@@ -40,7 +40,7 @@ fn run_training(config: &Config) -> MemoryPool {
         let loss_id = mse(out_id, target_id, &mut store, &mut graph, &mut pool);
 
         // backward
-        graph.backward(&mut store, loss_id);
+        graph.backward(&mut store, loss_id, &mut pool);
 
         // update weights
         let lr = 0.01;
@@ -248,6 +248,8 @@ fn run_kernel_benchmark() {
     println!("Size | Naive_med | Naive_p95 | Tiled_med | Tiled_p95 | TiledMP_med | TiledMP_p95 | Winner  | Scheduler");
     println!("-----|----------|----------|----------|----------|------------|------------|---------|----------");
 
+    let mut winners: Vec<(usize, KernelType)> = Vec::new();
+
     for &size in &sizes {
         let a = Tensor::new(random_matrix(&mut rng, size, size), vec![size, size], false);
         let b = Tensor::new(random_matrix(&mut rng, size, size), vec![size, size], false);
@@ -277,12 +279,12 @@ fn run_kernel_benchmark() {
             let _ = kernels::tiled_mp::matmul_tiled_mp(&a, &b, 16);
         }, warmup, trials);
 
-        let (winner, _best_ms) = if tiled_med <= naive_med && tiled_med <= tiled_mp_med {
-            ("Tiled", tiled_med)
+        let (winner_label, winner_kernel) = if tiled_med <= naive_med && tiled_med <= tiled_mp_med {
+            ("Tiled", KernelType::Tiled)
         } else if tiled_mp_med <= naive_med && tiled_mp_med <= tiled_med {
-            ("TiledMP", tiled_mp_med)
+            ("TiledMP", KernelType::TiledMP)
         } else {
-            ("Naive", naive_med)
+            ("Naive", KernelType::Naive)
         };
 
         let scheduled = select_kernel(size);
@@ -296,9 +298,26 @@ fn run_kernel_benchmark() {
             tiled_p95,
             tiled_mp_med,
             tiled_mp_p95,
-            winner,
+            winner_label,
             scheduled
         );
+
+        winners.push((size, winner_kernel));
+    }
+
+    if let Ok(path) = std::env::var("POOLGRAD_KERNEL_PROFILE_WRITE") {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        let _ = writeln!(&mut text, "# poolgrad kernel profile");
+        let _ = writeln!(&mut text, "# format: <size> <kernel>");
+        for (size, k) in &winners {
+            let _ = writeln!(&mut text, "{} {:?}", size, k);
+        }
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("Failed to write kernel profile to {}: {}", path, e);
+        } else {
+            println!("\nWrote kernel profile: {}", path);
+        }
     }
 }
 
@@ -361,7 +380,7 @@ fn run_kernel_pool_interaction_experiment() -> usize {
             let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
 
             let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
-            graph.backward(&mut store, out_id);
+            graph.backward(&mut store, out_id, &mut pool);
 
             // planner + pool: free intermediate grad buffers at their death step
             let lifetimes = compute_lifetimes(&graph);

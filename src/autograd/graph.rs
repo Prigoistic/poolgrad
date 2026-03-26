@@ -1,5 +1,20 @@
 use crate::autograd::node::{Node, Operation};
 use crate::tensor::store::TensorStore;
+use crate::tensor::tensor::Tensor;
+use crate::mem::pool::MemoryPool;
+use crate::kernels::naive::matmul_naive_add_into;
+use crate::kernels::tiled::matmul_tiled_into;
+use crate::kernels::tiled_mp::matmul_tiled_mp_into;
+use crate::kernels::selector::{select_kernel, KernelType};
+
+fn transpose_into(src: &[f32], src_rows: usize, src_cols: usize, dst: &mut [f32]) {
+    assert_eq!(dst.len(), src_rows * src_cols);
+    for r in 0..src_rows {
+        for c in 0..src_cols {
+            dst[c * src_rows + r] = src[r * src_cols + c];
+        }
+    }
+}
 
 
 
@@ -21,7 +36,7 @@ impl Graph {
         self.nodes.push(node);
     }
 
-    pub fn backward(&self, store: &mut TensorStore, loss_id: usize) {
+    pub fn backward(&self, store: &mut TensorStore, loss_id: usize, pool: &mut MemoryPool) {
         // Step 1: initialize d(loss)/d(loss) = 1
         {
             let loss = store.get_mut(loss_id); 
@@ -126,22 +141,27 @@ impl Graph {
                     }
 
                     // dA = dC @ B^T, dB = A^T @ dC
-                    let mut d_a = vec![0.0f32; m * n];
-                    let mut d_b = vec![0.0f32; n * p];
+                    // We compute this using the same kernel dispatch as forward. Since gradients
+                    // must accumulate (a tensor can be used multiple times), all kernel paths
+                    // used here add into the provided output buffer.
 
-                    for i in 0..m {
-                        for j in 0..p {
-                            let go = out_grad[i * p + j];
-                            for k in 0..n {
-                                d_a[i * n + k] += go * b_data[k * p + j];
-                                d_b[k * p + j] += a_data[i * n + k] * go;
-                            }
-                        }
-                    }
-
+                    // Same-id case is rare and shape-sensitive (dA and dB have different shapes
+                    // in general). Keep the simple loop implementation as a safe fallback.
                     if a_id == b_id {
-                        // Only valid for square A (m==n==p) in practice; we still accumulate safely.
                         if a_req {
+                            let mut d_a = vec![0.0f32; m * n];
+                            let mut d_b = vec![0.0f32; n * p];
+
+                            for i in 0..m {
+                                for j in 0..p {
+                                    let go = out_grad[i * p + j];
+                                    for k in 0..n {
+                                        d_a[i * n + k] += go * b_data[k * p + j];
+                                        d_b[k * p + j] += a_data[i * n + k] * go;
+                                    }
+                                }
+                            }
+
                             let a = store.get_mut(a_id);
                             for idx in 0..a.grad.len() {
                                 a.grad[idx] += d_a[idx];
@@ -150,18 +170,42 @@ impl Graph {
                                 }
                             }
                         }
-                    } else {
-                        let (a, b) = store.get2_mut(a_id, b_id);
-                        if a_req {
-                            for idx in 0..d_a.len() {
-                                a.grad[idx] += d_a[idx];
-                            }
+                        continue;
+                    }
+
+                    let kernel = select_kernel(m.max(n).max(p));
+                    let d_c = Tensor::new(out_grad, vec![m, p], false);
+
+                    let (a, b) = store.get2_mut(a_id, b_id);
+
+                    if a_req {
+                        // B^T: (p x n)
+                        let mut bt = pool.get(p * n);
+                        transpose_into(&b_data, n, p, &mut bt);
+                        let bt = Tensor::new(bt, vec![p, n], false);
+
+                        match kernel {
+                            KernelType::Naive => matmul_naive_add_into(&d_c, &bt, &mut a.grad),
+                            KernelType::Tiled => matmul_tiled_into(&d_c, &bt, &mut a.grad, 16),
+                            KernelType::TiledMP => matmul_tiled_mp_into(&d_c, &bt, &mut a.grad, 16),
                         }
-                        if b_req {
-                            for idx in 0..d_b.len() {
-                                b.grad[idx] += d_b[idx];
-                            }
+
+                        pool.release(bt.data);
+                    }
+
+                    if b_req {
+                        // A^T: (n x m)
+                        let mut at = pool.get(n * m);
+                        transpose_into(&a_data, m, n, &mut at);
+                        let at = Tensor::new(at, vec![n, m], false);
+
+                        match kernel {
+                            KernelType::Naive => matmul_naive_add_into(&at, &d_c, &mut b.grad),
+                            KernelType::Tiled => matmul_tiled_into(&at, &d_c, &mut b.grad, 16),
+                            KernelType::TiledMP => matmul_tiled_mp_into(&at, &d_c, &mut b.grad, 16),
                         }
+
+                        pool.release(at.data);
                     }
                 }
 
@@ -233,6 +277,7 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::Graph;
+    use crate::mem::pool::MemoryPool;
     use crate::tensor::store::TensorStore;
     use crate::tensor::tensor::{matmul, relu, Tensor};
 
@@ -240,13 +285,15 @@ mod tests {
     fn matmul_backward_matches_sums_when_loss_grad_is_ones() {
         let mut store = TensorStore::new();
         let mut graph = Graph::new();
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
 
         // A: 2x3, B: 3x2
         let a_id = store.add(Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true));
         let b_id = store.add(Tensor::new(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2], true));
 
         let out_id = matmul(a_id, b_id, &mut store, &mut graph);
-        graph.backward(&mut store, out_id);
+        graph.backward(&mut store, out_id, &mut pool);
 
         // With dC = ones, dA[i,k] = sum_j B[k,j]
         let expected_a_grad = vec![15.0, 19.0, 23.0, 15.0, 19.0, 23.0];
@@ -261,11 +308,13 @@ mod tests {
     fn relu_backward_masks_non_positive_inputs() {
         let mut store = TensorStore::new();
         let mut graph = Graph::new();
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
 
         let x_id = store.add(Tensor::new(vec![-1.0, 2.0, 0.5, 0.0], vec![4], true));
         let y_id = relu(x_id, &mut store, &mut graph);
 
-        graph.backward(&mut store, y_id);
+        graph.backward(&mut store, y_id, &mut pool);
 
         // dy/dx is 0 for x<=0, 1 for x>0 (with upstream grad = 1)
         assert_eq!(store.get(x_id).grad, vec![0.0, 1.0, 1.0, 0.0]);
