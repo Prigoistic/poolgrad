@@ -112,16 +112,20 @@ fn print_metrics(label: &str, pool: &MemoryPool) {
         0.0
     };
 
-    let peak_bytes = pool.peak_memory;
+    let live_peak_bytes = pool.peak_memory;
+    let cached_peak_bytes = pool.cached_peak;
+    let resident_peak_bytes = pool.resident_peak;
 
     println!("=== {} ===", label);
     println!(
-        "Mode | Allocations | Reuses | ReuseRate | Peak (bytes)\n{} | {} | {} | {:.2}% | {}",
+        "Mode | Allocations | Reuses | ReuseRate | LivePeak | CachedPeak | ResidentPeak\n{} | {} | {} | {:.2}% | {} | {} | {}",
         label,
         pool.allocations,
         pool.reuses,
         reuse_rate,
-        peak_bytes
+        live_peak_bytes,
+        cached_peak_bytes,
+        resident_peak_bytes
     );
 }
 
@@ -206,12 +210,24 @@ fn validate_kernels() {
     }
 }
 
-fn time_ms<F: FnMut()>(mut f: F, iters: usize) -> f64 {
-    let start = Instant::now();
-    for _ in 0..iters {
+fn bench_ms<F: FnMut()>(mut f: F, warmup: usize, trials: usize) -> (f64, f64) {
+    for _ in 0..warmup {
         f();
     }
-    start.elapsed().as_secs_f64() * 1000.0
+
+    let mut samples = Vec::with_capacity(trials);
+    for _ in 0..trials {
+        let start = Instant::now();
+        f();
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let median = samples[samples.len() / 2];
+    let p95_idx = ((samples.len() * 95 + 99) / 100).saturating_sub(1).min(samples.len() - 1);
+    let p95 = samples[p95_idx];
+
+    (median, p95)
 }
 
 fn run_kernel_benchmark() {
@@ -219,9 +235,18 @@ fn run_kernel_benchmark() {
     let mut rng = XorShift64::new(seed);
     let sizes = [16usize, 32, 64, 96, 128, 256];
 
-    println!("\nKernel benchmark (seed={:#x})", seed);
-    println!("Size | Naive(ms) | Tiled(ms) | TiledMP(ms) | Winner  | Scheduler");
-    println!("-----|----------|----------|------------|---------|----------");
+    let warmup = std::env::var("POOLGRAD_BENCH_WARMUP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2);
+    let trials = std::env::var("POOLGRAD_BENCH_TRIALS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(9);
+
+    println!("\nKernel benchmark (seed={:#x}, warmup={}, trials={})", seed, warmup, trials);
+    println!("Size | Naive_med | Naive_p95 | Tiled_med | Tiled_p95 | TiledMP_med | TiledMP_p95 | Winner  | Scheduler");
+    println!("-----|----------|----------|----------|----------|------------|------------|---------|----------");
 
     for &size in &sizes {
         let a = Tensor::new(random_matrix(&mut rng, size, size), vec![size, size], false);
@@ -229,16 +254,16 @@ fn run_kernel_benchmark() {
 
         let reference = matmul_naive(&a, &b);
 
-        let naive_ms = time_ms(|| {
+        let (naive_med, naive_p95) = bench_ms(|| {
             let _ = matmul_naive(&a, &b);
-        }, 1);
+        }, warmup, trials);
 
         let tiled_out = matmul_tiled(&a, &b, 16);
         let tiled_err = max_abs_diff(&reference.data, &tiled_out.data);
         assert!(tiled_err < 1e-4, "Tiled failed validation at size {}: err={}", size, tiled_err);
-        let tiled_ms = time_ms(|| {
+        let (tiled_med, tiled_p95) = bench_ms(|| {
             let _ = matmul_tiled(&a, &b, 16);
-        }, 1);
+        }, warmup, trials);
 
         let tiled_mp_out = kernels::tiled_mp::matmul_tiled_mp(&a, &b, 16);
         let tiled_mp_err = max_abs_diff(&reference.data, &tiled_mp_out.data);
@@ -248,23 +273,31 @@ fn run_kernel_benchmark() {
             size,
             tiled_mp_err
         );
-        let tiled_mp_ms = time_ms(|| {
+        let (tiled_mp_med, tiled_mp_p95) = bench_ms(|| {
             let _ = kernels::tiled_mp::matmul_tiled_mp(&a, &b, 16);
-        }, 1);
+        }, warmup, trials);
 
-        let (winner, _best_ms) = if tiled_ms <= naive_ms && tiled_ms <= tiled_mp_ms {
-            ("Tiled", tiled_ms)
-        } else if tiled_mp_ms <= naive_ms && tiled_mp_ms <= tiled_ms {
-            ("TiledMP", tiled_mp_ms)
+        let (winner, _best_ms) = if tiled_med <= naive_med && tiled_med <= tiled_mp_med {
+            ("Tiled", tiled_med)
+        } else if tiled_mp_med <= naive_med && tiled_mp_med <= tiled_med {
+            ("TiledMP", tiled_mp_med)
         } else {
-            ("Naive", naive_ms)
+            ("Naive", naive_med)
         };
 
         let scheduled = select_kernel(size);
 
         println!(
-            "{:>4} | {:>8.3} | {:>8.3} | {:>10.3} | {:<7} | {:?}",
-            size, naive_ms, tiled_ms, tiled_mp_ms, winner, scheduled
+            "{:>4} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>10.3} | {:>10.3} | {:<7} | {:?}",
+            size,
+            naive_med,
+            naive_p95,
+            tiled_med,
+            tiled_p95,
+            tiled_mp_med,
+            tiled_mp_p95,
+            winner,
+            scheduled
         );
     }
 }
@@ -307,8 +340,8 @@ fn run_kernel_pool_interaction_experiment() -> usize {
     pool.enabled = true;
 
     println!("\nKernel+Pool interaction experiment (scheduler drives kernel, pool drives grad reuse)");
-    println!("Size | Kernel | Iters | Time (ms) | Alloc | Reuse | Peak (bytes)");
-    println!("-----|--------|-------|-----------|-------|-------|-------------");
+    println!("Size | Kernel | Iters | Time (ms) | Alloc | Reuse | LivePeak | ResidentPeak");
+    println!("-----|--------|-------|-----------|-------|-------|---------|------------");
 
     let mut exp_peak = 0usize;
 
@@ -357,8 +390,15 @@ fn run_kernel_pool_interaction_experiment() -> usize {
         let reuse = pool.reuses - reuse0;
 
         println!(
-            "{:>4} | {:>6?} | {:>5} | {:>9.3} | {:>5} | {:>5} | {}",
-            size, kernel, iters, elapsed_ms, alloc, reuse, pool.peak_memory
+            "{:>4} | {:>6?} | {:>5} | {:>9.3} | {:>5} | {:>5} | {:>7} | {:>11}",
+            size,
+            kernel,
+            iters,
+            elapsed_ms,
+            alloc,
+            reuse,
+            pool.peak_memory,
+            pool.resident_peak
         );
 
         exp_peak = exp_peak.max(pool.peak_memory);
