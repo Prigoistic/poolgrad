@@ -14,6 +14,14 @@ pub enum KernelType {
     TiledMP,
 }
 
+fn parallel_enabled() -> bool {
+    std::env::var("POOLGRAD_PAR")
+        .ok()
+        .as_deref()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
 static KERNEL_PROFILE: OnceLock<Option<HashMap<usize, KernelType>>> = OnceLock::new();
 
 fn parse_kernel_name(s: &str) -> Option<KernelType> {
@@ -72,14 +80,21 @@ pub fn select_kernel(size: usize) -> KernelType {
     // - POOLGRAD_SCHED_NAIVE_MAX (default 8)
     // - POOLGRAD_SCHED_TILED_MAX (default 8)
     // Block-level MP is only attempted inside the tiled-MP kernel.
+    let (default_naive_max, default_tiled_max) = if parallel_enabled() {
+        // With Rayon enabled, naive (parallel over rows) is often competitive well past tiny sizes.
+        (256usize, 256usize)
+    } else {
+        (8usize, 8usize)
+    };
+
     let naive_max = std::env::var("POOLGRAD_SCHED_NAIVE_MAX")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8);
+        .unwrap_or(default_naive_max);
     let tiled_max = std::env::var("POOLGRAD_SCHED_TILED_MAX")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8);
+        .unwrap_or(default_tiled_max);
 
     if size <= naive_max {
         KernelType::Naive

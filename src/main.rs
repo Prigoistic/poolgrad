@@ -19,6 +19,28 @@ use kernels::tiled::matmul_tiled;
 use kernels::selector::select_kernel;
 use kernels::selector::{KernelType, matmul as matmul_by_kernel};
 
+fn install_broken_pipe_hook() {
+    // When piping to `head`/`awk`, the reader may close stdout early.
+    // Rust's println! will then panic with "failed printing to stdout: Broken pipe".
+    // Treat that as a normal early-exit instead of a crash.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut is_broken_pipe = false;
+
+        if let Some(s) = info.payload().downcast_ref::<&str>() {
+            is_broken_pipe = s.contains("Broken pipe") || s.contains("failed printing to stdout");
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            is_broken_pipe = s.contains("Broken pipe") || s.contains("failed printing to stdout");
+        }
+
+        if is_broken_pipe {
+            std::process::exit(0);
+        }
+
+        default_hook(info);
+    }));
+}
+
 struct Config {
     use_pool: bool,
     verbose: bool,
@@ -407,6 +429,8 @@ fn run_forward_backward_step_benchmark() {
 }
 
 fn main() {
+    install_broken_pipe_hook();
+
     // Ensure reproducible, end-to-end comparable metrics across runs.
     MemoryPool::reset_global_metrics();
 
