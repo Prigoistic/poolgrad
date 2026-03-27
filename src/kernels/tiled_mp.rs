@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::kernels::mp::{mp_block_mul_add, MPTransform, MPScratch};
-use crate::kernels::tiled::matmul_tiled_into;
+use crate::kernels::tiled::matmul_tiled_into_slices;
 use crate::tensor::tensor::Tensor;
 use rayon::prelude::*;
 
@@ -50,11 +50,17 @@ fn tiled_style_block_mul_accum(
     }
 }
 
-pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usize) {
-    let (m, n) = (a.shape[0], a.shape[1]);
-    let (n2, p) = (b.shape[0], b.shape[1]);
-
-    assert_eq!(n, n2);
+pub fn matmul_tiled_mp_into_slices(
+    a: &[f32],
+    m: usize,
+    n: usize,
+    b: &[f32],
+    p: usize,
+    out: &mut [f32],
+    block: usize,
+) {
+    assert_eq!(a.len(), m * n);
+    assert_eq!(b.len(), n * p);
     assert_eq!(out.len(), m * p);
 
     let size_hint = m.max(n).max(p);
@@ -66,7 +72,7 @@ pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usiz
 
     if !mp_enabled {
         // Exact fallback: reuse the existing tiled kernel, which matches naive accumulation order.
-        matmul_tiled_into(a, b, out, block);
+        matmul_tiled_into_slices(a, m, n, b, p, out, block);
         return;
     }
 
@@ -92,15 +98,13 @@ pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usiz
                         let bp = (jj + block).min(p) - jj;
                         let bn = (kk + block).min(n) - kk;
 
-                        // MP only supports full, square blocks here, and is guarded for numerical stability.
-                        // We also require bm == block because mp_block_mul_add assumes a full square output block.
                         if mp_enabled && bm == block && bp == block && bn == block {
                             let applied = mp_block_mul_add(
-                                &a.data,
+                                a,
                                 n,
                                 ii,
                                 kk,
-                                &b.data,
+                                b,
                                 p,
                                 kk,
                                 jj,
@@ -117,13 +121,12 @@ pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usiz
                             }
                         }
 
-                        // Fallback for edges or unsupported block sizes.
                         tiled_style_block_mul_accum(
-                            &a.data,
+                            a,
                             n,
                             ii,
                             kk,
-                            &b.data,
+                            b,
                             p,
                             kk,
                             jj,
@@ -147,14 +150,13 @@ pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usiz
                     let bp = (jj + block).min(p) - jj;
                     let bn = (kk + block).min(n) - kk;
 
-                    // MP only supports full, square blocks here, and is guarded for numerical stability.
                     if mp_enabled && bm == block && bp == block && bn == block {
                         let applied = mp_block_mul_add(
-                            &a.data,
+                            a,
                             n,
                             ii,
                             kk,
-                            &b.data,
+                            b,
                             p,
                             kk,
                             jj,
@@ -171,13 +173,12 @@ pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usiz
                         }
                     }
 
-                    // Fallback for edges or unsupported block sizes.
                     tiled_style_block_mul_accum(
-                        &a.data,
+                        a,
                         n,
                         ii,
                         kk,
-                        &b.data,
+                        b,
                         p,
                         kk,
                         jj,
@@ -193,6 +194,14 @@ pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usiz
             }
         }
     }
+}
+
+pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usize) {
+    let (m, n) = (a.shape[0], a.shape[1]);
+    let (n2, p) = (b.shape[0], b.shape[1]);
+
+    assert_eq!(n, n2);
+    matmul_tiled_mp_into_slices(&a.data, m, n, &b.data, p, out, block);
 }
 
 pub fn matmul_tiled_mp(a: &Tensor, b: &Tensor, block: usize) -> Tensor {

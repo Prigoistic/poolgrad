@@ -128,6 +128,51 @@ impl MemoryPool {
         vec![0.0; size]
     }
 
+    pub fn get_no_clear(&mut self, size: usize) -> Vec<f32> {
+        // Identical accounting to `get`, but does not clear reused buffers.
+        // Only use when the caller overwrites every element before reading.
+        let bytes = size
+            .checked_mul(4)
+            .expect("MemoryPool::get_no_clear: size overflow when computing bytes");
+
+        if self.enabled {
+            if let Some(buffers) = self.free.get_mut(&size) {
+                if let Some(buffer) = buffers.pop() {
+                    self.reuses += 1;
+
+                    self.cached_memory = self
+                        .cached_memory
+                        .checked_sub(bytes)
+                        .expect("MemoryPool::get_no_clear: cached_memory underflow");
+
+                    self.current_memory = self
+                        .current_memory
+                        .checked_add(bytes)
+                        .expect("MemoryPool::get_no_clear: current_memory overflow");
+
+                    let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                    update_global_peak(global_after);
+                    self.update_peaks();
+
+                    return buffer;
+                }
+            }
+        }
+
+        // Fresh allocation.
+        self.allocations += 1;
+        self.current_memory = self
+            .current_memory
+            .checked_add(bytes)
+            .expect("MemoryPool::get_no_clear: current_memory overflow");
+
+        let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        update_global_peak(global_after);
+        self.update_peaks();
+
+        vec![0.0; size]
+    }
+
     pub fn release(&mut self, buffer: Vec<f32>) {
         let size = buffer.len();
         let bytes = size

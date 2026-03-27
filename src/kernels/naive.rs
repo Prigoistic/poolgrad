@@ -16,11 +16,16 @@ fn par_min_elems() -> usize {
         .unwrap_or(16 * 1024)
 }
 
-pub fn matmul_naive_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
-    let (m, n) = (a.shape[0], a.shape[1]);
-    let (n2, p) = (b.shape[0], b.shape[1]);
-
-    assert_eq!(n, n2);
+pub fn matmul_naive_into_slices(
+    a: &[f32],
+    m: usize,
+    n: usize,
+    b: &[f32],
+    p: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(a.len(), m * n);
+    assert_eq!(b.len(), n * p);
     assert_eq!(out.len(), m * p);
 
     if parallel_enabled() && m * p >= par_min_elems() {
@@ -28,7 +33,7 @@ pub fn matmul_naive_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
             for j in 0..p {
                 let mut sum = 0.0;
                 for k in 0..n {
-                    sum += a.data[i * n + k] * b.data[k * p + j];
+                    sum += a[i * n + k] * b[k * p + j];
                 }
                 out_row[j] = sum;
             }
@@ -38,7 +43,7 @@ pub fn matmul_naive_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
             for j in 0..p {
                 let mut sum = 0.0;
                 for k in 0..n {
-                    sum += a.data[i * n + k] * b.data[k * p + j];
+                    sum += a[i * n + k] * b[k * p + j];
                 }
                 out[i * p + j] = sum;
             }
@@ -46,11 +51,16 @@ pub fn matmul_naive_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
     }
 }
 
-pub fn matmul_naive_add_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
-    let (m, n) = (a.shape[0], a.shape[1]);
-    let (n2, p) = (b.shape[0], b.shape[1]);
-
-    assert_eq!(n, n2);
+pub fn matmul_naive_add_into_slices(
+    a: &[f32],
+    m: usize,
+    n: usize,
+    b: &[f32],
+    p: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(a.len(), m * n);
+    assert_eq!(b.len(), n * p);
     assert_eq!(out.len(), m * p);
 
     if parallel_enabled() && m * p >= par_min_elems() {
@@ -58,7 +68,7 @@ pub fn matmul_naive_add_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
             for j in 0..p {
                 let mut sum = 0.0;
                 for k in 0..n {
-                    sum += a.data[i * n + k] * b.data[k * p + j];
+                    sum += a[i * n + k] * b[k * p + j];
                 }
                 out_row[j] += sum;
             }
@@ -68,12 +78,29 @@ pub fn matmul_naive_add_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
             for j in 0..p {
                 let mut sum = 0.0;
                 for k in 0..n {
-                    sum += a.data[i * n + k] * b.data[k * p + j];
+                    sum += a[i * n + k] * b[k * p + j];
                 }
                 out[i * p + j] += sum;
             }
         }
     }
+}
+
+pub fn matmul_naive_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
+    let (m, n) = (a.shape[0], a.shape[1]);
+    let (n2, p) = (b.shape[0], b.shape[1]);
+
+    assert_eq!(n, n2);
+    matmul_naive_into_slices(&a.data, m, n, &b.data, p, out);
+}
+
+#[allow(dead_code)]
+pub fn matmul_naive_add_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
+    let (m, n) = (a.shape[0], a.shape[1]);
+    let (n2, p) = (b.shape[0], b.shape[1]);
+
+    assert_eq!(n, n2);
+    matmul_naive_add_into_slices(&a.data, m, n, &b.data, p, out);
 }
 
 pub fn matmul_naive(a: &Tensor, b: &Tensor) -> Tensor {

@@ -1,17 +1,44 @@
 use crate::autograd::node::{Node, Operation};
 use crate::tensor::store::TensorStore;
-use crate::tensor::tensor::Tensor;
 use crate::mem::pool::MemoryPool;
-use crate::kernels::naive::matmul_naive_add_into;
-use crate::kernels::tiled::matmul_tiled_into;
-use crate::kernels::tiled_mp::matmul_tiled_mp_into;
+use crate::kernels::naive::matmul_naive_add_into_slices;
+use crate::kernels::tiled::matmul_tiled_into_slices;
+use crate::kernels::tiled_mp::matmul_tiled_mp_into_slices;
 use crate::kernels::selector::{select_kernel, KernelType};
+use rayon::prelude::*;
+
+fn parallel_enabled() -> bool {
+    std::env::var("POOLGRAD_PAR")
+        .ok()
+        .as_deref()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn par_min_elems() -> usize {
+    std::env::var("POOLGRAD_PAR_MIN_ELEMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16 * 1024)
+}
 
 fn transpose_into(src: &[f32], src_rows: usize, src_cols: usize, dst: &mut [f32]) {
     assert_eq!(dst.len(), src_rows * src_cols);
-    for r in 0..src_rows {
-        for c in 0..src_cols {
-            dst[c * src_rows + r] = src[r * src_cols + c];
+
+    if parallel_enabled() && src_rows * src_cols >= par_min_elems() {
+        // dst is (src_cols x src_rows) row-major, i.e. each dst row corresponds to a src column.
+        dst.par_chunks_mut(src_rows)
+            .enumerate()
+            .for_each(|(c, dst_row)| {
+                for r in 0..src_rows {
+                    dst_row[r] = src[r * src_cols + c];
+                }
+            });
+    } else {
+        for r in 0..src_rows {
+            for c in 0..src_cols {
+                dst[c * src_rows + r] = src[r * src_cols + c];
+            }
         }
     }
 }
@@ -51,88 +78,71 @@ impl Graph {
         for node in self.nodes.iter().rev() {
             match node.op {
                 Operation::Add => {
-                    let out_grad = store.get(node.output).grad.clone();
-
                     let a_id = node.inputs[0];
                     let b_id = node.inputs[1];
 
                     let a_req = store.get(a_id).requires_grad;
                     let b_req = store.get(b_id).requires_grad;
 
+                    if !a_req && !b_req {
+                        continue;
+                    }
+
                     if a_id == b_id {
                         if a_req {
-                            let a = store.get_mut(a_id);
-                            for i in 0..out_grad.len() {
-                                a.grad[i] += 2.0 * out_grad[i];
+                            let (a, out) = store.get_mut_and_1(a_id, node.output);
+                            for i in 0..out.grad.len() {
+                                a.grad[i] += 2.0 * out.grad[i];
                             }
                         }
                     } else {
-                        let (a, b) = store.get2_mut(a_id, b_id);
-                        for i in 0..out_grad.len() {
+                        let (a, b, out) = store.get2_mut_and_1(a_id, b_id, node.output);
+                        for i in 0..out.grad.len() {
                             if a_req {
-                                a.grad[i] += out_grad[i];
+                                a.grad[i] += out.grad[i];
                             }
                             if b_req {
-                                b.grad[i] += out_grad[i];
+                                b.grad[i] += out.grad[i];
                             }
                         }
                     }
                 }
 
                 Operation::Mul => {
-                    let out_grad = store.get(node.output).grad.clone();
-
                     let a_id = node.inputs[0];
                     let b_id = node.inputs[1];
-
-                    let a_data = store.get(a_id).data.clone();
-                    let b_data = store.get(b_id).data.clone();
 
                     let a_req = store.get(a_id).requires_grad;
                     let b_req = store.get(b_id).requires_grad;
 
+                    if !a_req && !b_req {
+                        continue;
+                    }
+
                     if a_id == b_id {
                         // y = a * a => dy/da = 2a
                         if a_req {
-                            let a = store.get_mut(a_id);
-                            for i in 0..out_grad.len() {
-                                a.grad[i] += 2.0 * a_data[i] * out_grad[i];
+                            let (a, out) = store.get_mut_and_1(a_id, node.output);
+                            for i in 0..out.grad.len() {
+                                a.grad[i] += 2.0 * a.data[i] * out.grad[i];
                             }
                         }
                     } else {
-                        let (a, b) = store.get2_mut(a_id, b_id);
-                        for i in 0..out_grad.len() {
+                        let (a, b, out) = store.get2_mut_and_1(a_id, b_id, node.output);
+                        for i in 0..out.grad.len() {
                             if a_req {
-                                a.grad[i] += b_data[i] * out_grad[i];
+                                a.grad[i] += b.data[i] * out.grad[i];
                             }
                             if b_req {
-                                b.grad[i] += a_data[i] * out_grad[i];
+                                b.grad[i] += a.data[i] * out.grad[i];
                             }
                         }
                     }
                 }
 
                 Operation::MatMul => {
-                    let out_grad = store.get(node.output).grad.clone();
-
                     let a_id = node.inputs[0];
                     let b_id = node.inputs[1];
-
-                    let a_shape = store.get(a_id).shape.clone();
-                    let b_shape = store.get(b_id).shape.clone();
-
-                    assert_eq!(a_shape.len(), 2, "A must be 2D for MatMul backward");
-                    assert_eq!(b_shape.len(), 2, "B must be 2D for MatMul backward");
-                    assert_eq!(a_shape[1], b_shape[0], "Inner dimensions must match");
-
-                    let (m, n) = (a_shape[0], a_shape[1]);
-                    let p = b_shape[1];
-
-                    assert_eq!(out_grad.len(), m * p, "Output grad has wrong size");
-
-                    let a_data = store.get(a_id).data.clone();
-                    let b_data = store.get(b_id).data.clone();
-
                     let a_req = store.get(a_id).requires_grad;
                     let b_req = store.get(b_id).requires_grad;
 
@@ -148,81 +158,98 @@ impl Graph {
                     // Same-id case is rare and shape-sensitive (dA and dB have different shapes
                     // in general). Keep the simple loop implementation as a safe fallback.
                     if a_id == b_id {
+                        // Same-id case: implies square matrix multiply in forward (n == m).
+                        let (a, out) = store.get_mut_and_1(a_id, node.output);
+
+                        assert_eq!(a.shape.len(), 2, "A must be 2D for MatMul backward");
+                        let (m, n) = (a.shape[0], a.shape[1]);
+                        assert_eq!(m, n, "MatMul backward (same-id): requires square matrix");
+                        let p = n;
+                        assert_eq!(out.grad.len(), m * p, "Output grad has wrong size");
+
                         if a_req {
-                            let mut d_a = vec![0.0f32; m * n];
-                            let mut d_b = vec![0.0f32; n * p];
+                            let mut d_a = pool.get(m * n);
+                            let mut d_b = pool.get(n * p);
 
                             for i in 0..m {
                                 for j in 0..p {
-                                    let go = out_grad[i * p + j];
+                                    let go = out.grad[i * p + j];
                                     for k in 0..n {
-                                        d_a[i * n + k] += go * b_data[k * p + j];
-                                        d_b[k * p + j] += a_data[i * n + k] * go;
+                                        d_a[i * n + k] += go * a.data[k * p + j];
+                                        d_b[k * p + j] += a.data[i * n + k] * go;
                                     }
                                 }
                             }
 
-                            let a = store.get_mut(a_id);
                             for idx in 0..a.grad.len() {
                                 a.grad[idx] += d_a[idx];
                                 if b_req && idx < d_b.len() {
                                     a.grad[idx] += d_b[idx];
                                 }
                             }
+
+                            pool.release(d_a);
+                            pool.release(d_b);
                         }
+
                         continue;
                     }
 
-                    let kernel = select_kernel(m.max(n).max(p));
-                    let d_c = Tensor::new(out_grad, vec![m, p], false);
+                    let (a, b, out) = store.get2_mut_and_1(a_id, b_id, node.output);
 
-                    let (a, b) = store.get2_mut(a_id, b_id);
+                    assert_eq!(a.shape.len(), 2, "A must be 2D for MatMul backward");
+                    assert_eq!(b.shape.len(), 2, "B must be 2D for MatMul backward");
+                    assert_eq!(a.shape[1], b.shape[0], "Inner dimensions must match");
+
+                    let (m, n) = (a.shape[0], a.shape[1]);
+                    let p = b.shape[1];
+                    assert_eq!(out.grad.len(), m * p, "Output grad has wrong size");
+
+                    let kernel = select_kernel(m.max(n).max(p));
+                    let d_c = out.grad.as_slice();
 
                     if a_req {
                         // B^T: (p x n)
-                        let mut bt = pool.get(p * n);
-                        transpose_into(&b_data, n, p, &mut bt);
-                        let bt = Tensor::new(bt, vec![p, n], false);
+                        let mut bt = pool.get_no_clear(p * n);
+                        transpose_into(&b.data, n, p, &mut bt);
 
                         match kernel {
-                            KernelType::Naive => matmul_naive_add_into(&d_c, &bt, &mut a.grad),
-                            KernelType::Tiled => matmul_tiled_into(&d_c, &bt, &mut a.grad, 16),
-                            KernelType::TiledMP => matmul_tiled_mp_into(&d_c, &bt, &mut a.grad, 16),
+                            KernelType::Naive => matmul_naive_add_into_slices(d_c, m, p, &bt, n, &mut a.grad),
+                            KernelType::Tiled => matmul_tiled_into_slices(d_c, m, p, &bt, n, &mut a.grad, 16),
+                            KernelType::TiledMP => matmul_tiled_mp_into_slices(d_c, m, p, &bt, n, &mut a.grad, 16),
                         }
 
-                        pool.release(bt.data);
+                        pool.release(bt);
                     }
 
                     if b_req {
                         // A^T: (n x m)
-                        let mut at = pool.get(n * m);
-                        transpose_into(&a_data, m, n, &mut at);
-                        let at = Tensor::new(at, vec![n, m], false);
+                        let mut at = pool.get_no_clear(n * m);
+                        transpose_into(&a.data, m, n, &mut at);
 
                         match kernel {
-                            KernelType::Naive => matmul_naive_add_into(&at, &d_c, &mut b.grad),
-                            KernelType::Tiled => matmul_tiled_into(&at, &d_c, &mut b.grad, 16),
-                            KernelType::TiledMP => matmul_tiled_mp_into(&at, &d_c, &mut b.grad, 16),
+                            KernelType::Naive => matmul_naive_add_into_slices(&at, n, m, d_c, p, &mut b.grad),
+                            KernelType::Tiled => matmul_tiled_into_slices(&at, n, m, d_c, p, &mut b.grad, 16),
+                            KernelType::TiledMP => matmul_tiled_mp_into_slices(&at, n, m, d_c, p, &mut b.grad, 16),
                         }
 
-                        pool.release(at.data);
+                        pool.release(at);
                     }
                 }
 
                 Operation::ReLU => {
-                    let out_grad = store.get(node.output).grad.clone();
                     let input_id = node.inputs[0];
 
                     if !store.get(input_id).requires_grad {
                         continue;
                     }
 
-                    let input_data = store.get(input_id).data.clone();
-                    let input = store.get_mut(input_id);
+                    let (input, out) = store.get_mut_and_1(input_id, node.output);
 
-                    for i in 0..out_grad.len() {
-                        let grad = if input_data[i] > 0.0 { 1.0 } else { 0.0 };
-                        input.grad[i] += grad * out_grad[i];
+                    for i in 0..out.grad.len() {
+                        if input.data[i] > 0.0 {
+                            input.grad[i] += out.grad[i];
+                        }
                     }
                 }
 
@@ -230,40 +257,36 @@ impl Graph {
                     // loss = mean((pred - target)^2)
                     // dloss/dpred = (2/N) * (pred - target) * upstream
                     // dloss/dtarget = -(2/N) * (pred - target) * upstream
-                    let out_grad = store.get(node.output).grad.clone();
-                    let upstream = out_grad[0];
-
                     let pred_id = node.inputs[0];
                     let target_id = node.inputs[1];
 
                     let pred_req = store.get(pred_id).requires_grad;
                     let target_req = store.get(target_id).requires_grad;
 
-                    let pred_data = store.get(pred_id).data.clone();
-                    let target_data = store.get(target_id).data.clone();
+                    if pred_id == target_id {
+                        continue;
+                    }
+
+                    let (pred, target, out) = store.get2_mut_and_1(pred_id, target_id, node.output);
+                    let upstream = out.grad[0];
 
                     assert_eq!(
-                        pred_data.len(),
-                        target_data.len(),
+                        pred.data.len(),
+                        target.data.len(),
                         "MSE backward: pred and target must have same length"
                     );
 
-                    let n = pred_data.len() as f32;
+                    let n = pred.data.len() as f32;
                     let scale = 2.0 / n;
 
-                    if pred_id == target_id {
-                        // (pred - pred) == 0, gradients are zero
-                    } else {
-                        let (pred, target) = store.get2_mut(pred_id, target_id);
-                        for i in 0..pred_data.len() {
-                            let diff = pred_data[i] - target_data[i];
-                            let g = scale * diff * upstream;
-                            if pred_req {
-                                pred.grad[i] += g;
-                            }
-                            if target_req {
-                                target.grad[i] -= g;
-                            }
+                    for i in 0..pred.data.len() {
+                        let diff = pred.data[i] - target.data[i];
+                        let g = scale * diff * upstream;
+                        if pred_req {
+                            pred.grad[i] += g;
+                        }
+                        if target_req {
+                            target.grad[i] -= g;
                         }
                     }
                 }

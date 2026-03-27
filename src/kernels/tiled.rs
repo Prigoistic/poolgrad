@@ -16,11 +16,17 @@ fn par_min_elems() -> usize {
         .unwrap_or(16 * 1024)
 }
 
-pub fn matmul_tiled_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usize) {
-    let (m, n) = (a.shape[0], a.shape[1]);
-    let (n2, p) = (b.shape[0], b.shape[1]);
-
-    assert_eq!(n, n2);
+pub fn matmul_tiled_into_slices(
+    a: &[f32],
+    m: usize,
+    n: usize,
+    b: &[f32],
+    p: usize,
+    out: &mut [f32],
+    block: usize,
+) {
+    assert_eq!(a.len(), m * n);
+    assert_eq!(b.len(), n * p);
     assert_eq!(out.len(), m * p);
 
     if parallel_enabled() && m * p >= par_min_elems() && block > 0 {
@@ -45,7 +51,7 @@ pub fn matmul_tiled_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usize) 
                                 let out_idx = i_local * p + j;
                                 let mut sum = out_chunk[out_idx];
                                 for k in kk..(kk + block).min(n) {
-                                    sum += a.data[i * n + k] * b.data[k * p + j];
+                                    sum += a[i * n + k] * b[k * p + j];
                                 }
                                 out_chunk[out_idx] = sum;
                             }
@@ -61,7 +67,7 @@ pub fn matmul_tiled_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usize) 
                         for j in jj..(jj + block).min(p) {
                             let mut sum = out[i * p + j];
                             for k in kk..(kk + block).min(n) {
-                                sum += a.data[i * n + k] * b.data[k * p + j];
+                                sum += a[i * n + k] * b[k * p + j];
                             }
                             out[i * p + j] = sum;
                         }
@@ -70,6 +76,14 @@ pub fn matmul_tiled_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usize) 
             }
         }
     }
+}
+
+pub fn matmul_tiled_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usize) {
+    let (m, n) = (a.shape[0], a.shape[1]);
+    let (n2, p) = (b.shape[0], b.shape[1]);
+
+    assert_eq!(n, n2);
+    matmul_tiled_into_slices(&a.data, m, n, &b.data, p, out, block);
 }
 
 pub fn matmul_tiled(a: &Tensor, b: &Tensor, block: usize) -> Tensor {
