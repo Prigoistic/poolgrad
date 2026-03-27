@@ -3,6 +3,22 @@
 use crate::kernels::mp::{mp_block_mul_add, MPTransform, MPScratch};
 use crate::kernels::tiled::matmul_tiled_into;
 use crate::tensor::tensor::Tensor;
+use rayon::prelude::*;
+
+fn parallel_enabled() -> bool {
+    std::env::var("POOLGRAD_PAR")
+        .ok()
+        .as_deref()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn par_min_elems() -> usize {
+    std::env::var("POOLGRAD_PAR_MIN_ELEMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16 * 1024)
+}
 
 fn tiled_style_block_mul_accum(
     a: &[f32],
@@ -55,18 +71,108 @@ pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usiz
     }
 
     let transform = MPTransform::strassen();
-    let mut scratch = MPScratch::new();
 
-    for ii in (0..m).step_by(block) {
-        for jj in (0..p).step_by(block) {
-            for kk in (0..n).step_by(block) {
-                let bm = (ii + block).min(m) - ii;
-                let bp = (jj + block).min(p) - jj;
-                let bn = (kk + block).min(n) - kk;
+    if parallel_enabled() && m * p >= par_min_elems() && block > 0 {
+        let rows_per_chunk = block.min(m).max(1);
+        let chunk_elems = rows_per_chunk * p;
 
-                // MP only supports full, square blocks here, and is guarded for numerical stability.
-                if mp_enabled && bm == block && bp == block && bn == block {
-                    let applied = mp_block_mul_add(
+        out.par_chunks_mut(chunk_elems)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let ii = chunk_idx * rows_per_chunk;
+                if ii >= m {
+                    return;
+                }
+                let bm = ((ii + rows_per_chunk).min(m)) - ii;
+
+                let mut scratch = MPScratch::new();
+
+                for jj in (0..p).step_by(block) {
+                    for kk in (0..n).step_by(block) {
+                        let bp = (jj + block).min(p) - jj;
+                        let bn = (kk + block).min(n) - kk;
+
+                        // MP only supports full, square blocks here, and is guarded for numerical stability.
+                        // We also require bm == block because mp_block_mul_add assumes a full square output block.
+                        if mp_enabled && bm == block && bp == block && bn == block {
+                            let applied = mp_block_mul_add(
+                                &a.data,
+                                n,
+                                ii,
+                                kk,
+                                &b.data,
+                                p,
+                                kk,
+                                jj,
+                                out_chunk,
+                                p,
+                                0,
+                                jj,
+                                block,
+                                &transform,
+                                &mut scratch,
+                            );
+                            if applied {
+                                continue;
+                            }
+                        }
+
+                        // Fallback for edges or unsupported block sizes.
+                        tiled_style_block_mul_accum(
+                            &a.data,
+                            n,
+                            ii,
+                            kk,
+                            &b.data,
+                            p,
+                            kk,
+                            jj,
+                            out_chunk,
+                            p,
+                            0,
+                            jj,
+                            bm,
+                            bn,
+                            bp,
+                        );
+                    }
+                }
+            });
+    } else {
+        let mut scratch = MPScratch::new();
+        for ii in (0..m).step_by(block) {
+            for jj in (0..p).step_by(block) {
+                for kk in (0..n).step_by(block) {
+                    let bm = (ii + block).min(m) - ii;
+                    let bp = (jj + block).min(p) - jj;
+                    let bn = (kk + block).min(n) - kk;
+
+                    // MP only supports full, square blocks here, and is guarded for numerical stability.
+                    if mp_enabled && bm == block && bp == block && bn == block {
+                        let applied = mp_block_mul_add(
+                            &a.data,
+                            n,
+                            ii,
+                            kk,
+                            &b.data,
+                            p,
+                            kk,
+                            jj,
+                            out,
+                            p,
+                            ii,
+                            jj,
+                            block,
+                            &transform,
+                            &mut scratch,
+                        );
+                        if applied {
+                            continue;
+                        }
+                    }
+
+                    // Fallback for edges or unsupported block sizes.
+                    tiled_style_block_mul_accum(
                         &a.data,
                         n,
                         ii,
@@ -79,22 +185,11 @@ pub fn matmul_tiled_mp_into(a: &Tensor, b: &Tensor, out: &mut [f32], block: usiz
                         p,
                         ii,
                         jj,
-                        block,
-                        &transform,
-                        &mut scratch,
+                        bm,
+                        bn,
+                        bp,
                     );
-                    if applied {
-                        continue;
-                    }
                 }
-
-                // Fallback for edges or unsupported block sizes.
-                tiled_style_block_mul_accum(
-                    &a.data, n, ii, kk,
-                    &b.data, p, kk, jj,
-                    out, p, ii, jj,
-                    bm, bn, bp,
-                );
             }
         }
     }
