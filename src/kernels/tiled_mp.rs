@@ -2,6 +2,9 @@
 
 use crate::kernels::mp::{mp_block_mul_add, MPTransform, MPScratch};
 use crate::kernels::tiled::matmul_tiled_into_slices;
+use crate::kernels::tiled::{
+    matmul_tiled_add_into_slices_a_transposed, matmul_tiled_add_into_slices_b_transposed,
+};
 use crate::tensor::tensor::Tensor;
 use rayon::prelude::*;
 
@@ -212,4 +215,36 @@ pub fn matmul_tiled_mp(a: &Tensor, b: &Tensor, block: usize) -> Tensor {
     matmul_tiled_mp_into(a, b, &mut result, block);
 
     Tensor::new(result, vec![m, p], a.requires_grad || b.requires_grad)
+}
+
+/// Accumulates `out += a @ b^T` without materializing `b^T`.
+///
+/// This MP kernel currently delegates to the tiled implementation for the
+/// implicit-transpose variants.
+pub fn matmul_tiled_mp_add_into_slices_b_transposed(
+    a: &[f32],
+    m: usize,
+    k: usize,
+    b: &[f32],
+    n: usize,
+    out: &mut [f32],
+    block: usize,
+) {
+    matmul_tiled_add_into_slices_b_transposed(a, m, k, b, n, out, block);
+}
+
+/// Accumulates `out += a^T @ b` without materializing `a^T`.
+///
+/// This MP kernel currently delegates to the tiled implementation for the
+/// implicit-transpose variants.
+pub fn matmul_tiled_mp_add_into_slices_a_transposed(
+    a: &[f32],
+    m: usize,
+    n: usize,
+    b: &[f32],
+    p: usize,
+    out: &mut [f32],
+    block: usize,
+) {
+    matmul_tiled_add_into_slices_a_transposed(a, m, n, b, p, out, block);
 }

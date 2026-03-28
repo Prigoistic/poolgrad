@@ -86,6 +86,92 @@ pub fn matmul_naive_add_into_slices(
     }
 }
 
+/// Accumulates `out += a @ b^T` without materializing `b^T`.
+///
+/// Shapes:
+/// - `a` is (m x k)
+/// - `b` is (n x k) row-major
+/// - `out` is (m x n)
+pub fn matmul_naive_add_into_slices_b_transposed(
+    a: &[f32],
+    m: usize,
+    k: usize,
+    b: &[f32],
+    n: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    assert_eq!(out.len(), m * n);
+
+    if parallel_enabled() && m * n >= par_min_elems() {
+        out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
+            let a_row = &a[i * k..(i + 1) * k];
+            for j in 0..n {
+                let b_row = &b[j * k..(j + 1) * k];
+                let mut sum = 0.0;
+                for kk in 0..k {
+                    sum += a_row[kk] * b_row[kk];
+                }
+                out_row[j] += sum;
+            }
+        });
+    } else {
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            for j in 0..n {
+                let b_row = &b[j * k..(j + 1) * k];
+                let mut sum = 0.0;
+                for kk in 0..k {
+                    sum += a_row[kk] * b_row[kk];
+                }
+                out[i * n + j] += sum;
+            }
+        }
+    }
+}
+
+/// Accumulates `out += a^T @ b` without materializing `a^T`.
+///
+/// Shapes:
+/// - `a` is (m x n) row-major
+/// - `b` is (m x p) row-major
+/// - `out` is (n x p)
+pub fn matmul_naive_add_into_slices_a_transposed(
+    a: &[f32],
+    m: usize,
+    n: usize,
+    b: &[f32],
+    p: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(a.len(), m * n);
+    assert_eq!(b.len(), m * p);
+    assert_eq!(out.len(), n * p);
+
+    if parallel_enabled() && n * p >= par_min_elems() {
+        out.par_chunks_mut(p).enumerate().for_each(|(i, out_row)| {
+            for j in 0..p {
+                let mut sum = 0.0;
+                for kk in 0..m {
+                    sum += a[kk * n + i] * b[kk * p + j];
+                }
+                out_row[j] += sum;
+            }
+        });
+    } else {
+        for i in 0..n {
+            for j in 0..p {
+                let mut sum = 0.0;
+                for kk in 0..m {
+                    sum += a[kk * n + i] * b[kk * p + j];
+                }
+                out[i * p + j] += sum;
+            }
+        }
+    }
+}
+
 pub fn matmul_naive_into(a: &Tensor, b: &Tensor, out: &mut [f32]) {
     let (m, n) = (a.shape[0], a.shape[1]);
     let (n2, p) = (b.shape[0], b.shape[1]);
