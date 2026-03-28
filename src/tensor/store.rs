@@ -28,7 +28,10 @@ impl TensorStore {
 
     #[allow(dead_code)]
     pub fn get2_mut(&mut self, id1: usize, id2: usize) -> (&mut Tensor, &mut Tensor) {
-        assert_ne!(id1, id2, "ids must be distinct; use get_mut for same-id case");
+        assert_ne!(
+            id1, id2,
+            "ids must be distinct; use get_mut for same-id case"
+        );
 
         let (low, high, low_first) = if id1 < id2 {
             (id1, id2, true)

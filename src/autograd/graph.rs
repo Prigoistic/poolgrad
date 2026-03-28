@@ -3,18 +3,15 @@ use crate::mem::pool::MemoryPool;
 use crate::tensor::store::TensorStore;
 
 use crate::kernels::naive::{
-    matmul_naive_add_into_slices_a_transposed,
-    matmul_naive_add_into_slices_b_transposed,
+    matmul_naive_add_into_slices_a_transposed, matmul_naive_add_into_slices_b_transposed,
 };
+use crate::kernels::selector::{KernelType, select_kernel};
 use crate::kernels::tiled::{
-    matmul_tiled_add_into_slices_a_transposed,
-    matmul_tiled_add_into_slices_b_transposed,
+    matmul_tiled_add_into_slices_a_transposed, matmul_tiled_add_into_slices_b_transposed,
 };
 use crate::kernels::tiled_mp::{
-    matmul_tiled_mp_add_into_slices_a_transposed,
-    matmul_tiled_mp_add_into_slices_b_transposed,
+    matmul_tiled_mp_add_into_slices_a_transposed, matmul_tiled_mp_add_into_slices_b_transposed,
 };
-use crate::kernels::selector::{select_kernel, KernelType};
 
 use std::collections::HashMap;
 
@@ -102,10 +99,10 @@ impl Graph {
             if node.input0 < touched.len() {
                 touched[node.input0] = true;
             }
-            if let Some(id) = node.input1 {
-                if id < touched.len() {
-                    touched[id] = true;
-                }
+            if let Some(id) = node.input1
+                && id < touched.len()
+            {
+                touched[id] = true;
             }
         }
 
@@ -123,7 +120,12 @@ impl Graph {
             if t.grad.is_empty() {
                 t.grad = pool.get(t.data.len());
             } else {
-                debug_assert_eq!(t.grad.len(), t.data.len(), "Tensor {}: grad len != data len", id);
+                debug_assert_eq!(
+                    t.grad.len(),
+                    t.data.len(),
+                    "Tensor {}: grad len != data len",
+                    id
+                );
                 t.grad.fill(0.0);
             }
         }
@@ -171,7 +173,11 @@ impl Graph {
                                 "Add backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
                                 a_id
                             );
-                            debug_assert_eq!(out.grad.len(), a.grad.len(), "Add backward: grad size mismatch");
+                            debug_assert_eq!(
+                                out.grad.len(),
+                                a.grad.len(),
+                                "Add backward: grad size mismatch"
+                            );
                             for i in 0..out.grad.len() {
                                 a.grad[i] += 2.0 * out.grad[i];
                             }
@@ -194,8 +200,16 @@ impl Graph {
                                 b_id
                             );
                         }
-                        debug_assert_eq!(out.grad.len(), a.grad.len(), "Add backward: grad size mismatch");
-                        debug_assert_eq!(out.grad.len(), b.grad.len(), "Add backward: grad size mismatch");
+                        debug_assert_eq!(
+                            out.grad.len(),
+                            a.grad.len(),
+                            "Add backward: grad size mismatch"
+                        );
+                        debug_assert_eq!(
+                            out.grad.len(),
+                            b.grad.len(),
+                            "Add backward: grad size mismatch"
+                        );
                         for i in 0..out.grad.len() {
                             if a_req {
                                 a.grad[i] += out.grad[i];
@@ -233,7 +247,11 @@ impl Graph {
                                 "Mul backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
                                 a_id
                             );
-                            debug_assert_eq!(out.grad.len(), a.grad.len(), "Mul backward: grad size mismatch");
+                            debug_assert_eq!(
+                                out.grad.len(),
+                                a.grad.len(),
+                                "Mul backward: grad size mismatch"
+                            );
                             for i in 0..out.grad.len() {
                                 a.grad[i] += 2.0 * a.data[i] * out.grad[i];
                             }
@@ -256,8 +274,16 @@ impl Graph {
                                 b_id
                             );
                         }
-                        debug_assert_eq!(out.grad.len(), a.grad.len(), "Mul backward: grad size mismatch");
-                        debug_assert_eq!(out.grad.len(), b.grad.len(), "Mul backward: grad size mismatch");
+                        debug_assert_eq!(
+                            out.grad.len(),
+                            a.grad.len(),
+                            "Mul backward: grad size mismatch"
+                        );
+                        debug_assert_eq!(
+                            out.grad.len(),
+                            b.grad.len(),
+                            "Mul backward: grad size mismatch"
+                        );
                         for i in 0..out.grad.len() {
                             if a_req {
                                 a.grad[i] += b.data[i] * out.grad[i];
@@ -309,27 +335,65 @@ impl Graph {
 
                             // Term 1: dC @ A^T
                             match kernel {
-                                KernelType::Naive => {
-                                    matmul_naive_add_into_slices_b_transposed(d_c, m, p, &a.data, n, &mut a.grad)
-                                }
-                                KernelType::Tiled => {
-                                    matmul_tiled_add_into_slices_b_transposed(d_c, m, p, &a.data, n, &mut a.grad, 16)
-                                }
+                                KernelType::Naive => matmul_naive_add_into_slices_b_transposed(
+                                    d_c,
+                                    m,
+                                    p,
+                                    &a.data,
+                                    n,
+                                    &mut a.grad,
+                                ),
+                                KernelType::Tiled => matmul_tiled_add_into_slices_b_transposed(
+                                    d_c,
+                                    m,
+                                    p,
+                                    &a.data,
+                                    n,
+                                    &mut a.grad,
+                                    16,
+                                ),
                                 KernelType::TiledMP => {
-                                    matmul_tiled_mp_add_into_slices_b_transposed(d_c, m, p, &a.data, n, &mut a.grad, 16)
+                                    matmul_tiled_mp_add_into_slices_b_transposed(
+                                        d_c,
+                                        m,
+                                        p,
+                                        &a.data,
+                                        n,
+                                        &mut a.grad,
+                                        16,
+                                    )
                                 }
                             }
 
                             // Term 2: A^T @ dC
                             match kernel {
-                                KernelType::Naive => {
-                                    matmul_naive_add_into_slices_a_transposed(&a.data, m, n, d_c, p, &mut a.grad)
-                                }
-                                KernelType::Tiled => {
-                                    matmul_tiled_add_into_slices_a_transposed(&a.data, m, n, d_c, p, &mut a.grad, 16)
-                                }
+                                KernelType::Naive => matmul_naive_add_into_slices_a_transposed(
+                                    &a.data,
+                                    m,
+                                    n,
+                                    d_c,
+                                    p,
+                                    &mut a.grad,
+                                ),
+                                KernelType::Tiled => matmul_tiled_add_into_slices_a_transposed(
+                                    &a.data,
+                                    m,
+                                    n,
+                                    d_c,
+                                    p,
+                                    &mut a.grad,
+                                    16,
+                                ),
                                 KernelType::TiledMP => {
-                                    matmul_tiled_mp_add_into_slices_a_transposed(&a.data, m, n, d_c, p, &mut a.grad, 16)
+                                    matmul_tiled_mp_add_into_slices_a_transposed(
+                                        &a.data,
+                                        m,
+                                        n,
+                                        d_c,
+                                        p,
+                                        &mut a.grad,
+                                        16,
+                                    )
                                 }
                             }
                         }
@@ -371,30 +435,64 @@ impl Graph {
                     if a_req {
                         // dA = dC @ B^T
                         match kernel {
-                            KernelType::Naive => {
-                                matmul_naive_add_into_slices_b_transposed(d_c, m, p, &b.data, n, &mut a.grad)
-                            }
-                            KernelType::Tiled => {
-                                matmul_tiled_add_into_slices_b_transposed(d_c, m, p, &b.data, n, &mut a.grad, 16)
-                            }
-                            KernelType::TiledMP => {
-                                matmul_tiled_mp_add_into_slices_b_transposed(d_c, m, p, &b.data, n, &mut a.grad, 16)
-                            }
+                            KernelType::Naive => matmul_naive_add_into_slices_b_transposed(
+                                d_c,
+                                m,
+                                p,
+                                &b.data,
+                                n,
+                                &mut a.grad,
+                            ),
+                            KernelType::Tiled => matmul_tiled_add_into_slices_b_transposed(
+                                d_c,
+                                m,
+                                p,
+                                &b.data,
+                                n,
+                                &mut a.grad,
+                                16,
+                            ),
+                            KernelType::TiledMP => matmul_tiled_mp_add_into_slices_b_transposed(
+                                d_c,
+                                m,
+                                p,
+                                &b.data,
+                                n,
+                                &mut a.grad,
+                                16,
+                            ),
                         }
                     }
 
                     if b_req {
                         // dB = A^T @ dC
                         match kernel {
-                            KernelType::Naive => {
-                                matmul_naive_add_into_slices_a_transposed(&a.data, m, n, d_c, p, &mut b.grad)
-                            }
-                            KernelType::Tiled => {
-                                matmul_tiled_add_into_slices_a_transposed(&a.data, m, n, d_c, p, &mut b.grad, 16)
-                            }
-                            KernelType::TiledMP => {
-                                matmul_tiled_mp_add_into_slices_a_transposed(&a.data, m, n, d_c, p, &mut b.grad, 16)
-                            }
+                            KernelType::Naive => matmul_naive_add_into_slices_a_transposed(
+                                &a.data,
+                                m,
+                                n,
+                                d_c,
+                                p,
+                                &mut b.grad,
+                            ),
+                            KernelType::Tiled => matmul_tiled_add_into_slices_a_transposed(
+                                &a.data,
+                                m,
+                                n,
+                                d_c,
+                                p,
+                                &mut b.grad,
+                                16,
+                            ),
+                            KernelType::TiledMP => matmul_tiled_mp_add_into_slices_a_transposed(
+                                &a.data,
+                                m,
+                                n,
+                                d_c,
+                                p,
+                                &mut b.grad,
+                                16,
+                            ),
                         }
                     }
                 }
@@ -415,7 +513,11 @@ impl Graph {
                         "ReLU backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
                         input_id
                     );
-                    debug_assert_eq!(out.grad.len(), input.grad.len(), "ReLU backward: grad size mismatch");
+                    debug_assert_eq!(
+                        out.grad.len(),
+                        input.grad.len(),
+                        "ReLU backward: grad size mismatch"
+                    );
                     for i in 0..out.grad.len() {
                         if input.data[i] > 0.0 {
                             input.grad[i] += out.grad[i];
@@ -441,10 +543,18 @@ impl Graph {
                     }
 
                     let (pred, target, out) = store.get2_mut_and_1(pred_id, target_id, node.output);
-                    assert_eq!(out.grad.len(), 1, "MSE backward: loss output must be scalar (grad len == 1)");
+                    assert_eq!(
+                        out.grad.len(),
+                        1,
+                        "MSE backward: loss output must be scalar (grad len == 1)"
+                    );
                     let upstream = out.grad[0];
 
-                    assert_eq!(pred.data.len(), target.data.len(), "MSE backward: pred and target must have same length");
+                    assert_eq!(
+                        pred.data.len(),
+                        target.data.len(),
+                        "MSE backward: pred and target must have same length"
+                    );
                     assert!(
                         !pred.data.is_empty(),
                         "MSE backward: empty tensors are not supported"
@@ -489,7 +599,7 @@ mod tests {
     use super::Graph;
     use crate::mem::pool::MemoryPool;
     use crate::tensor::store::TensorStore;
-    use crate::tensor::tensor::{matmul, relu, Tensor};
+    use crate::tensor::tensor::{Tensor, matmul, relu};
 
     #[test]
     fn matmul_backward_matches_sums_when_loss_grad_is_ones() {

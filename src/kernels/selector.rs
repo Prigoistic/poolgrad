@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
-use crate::tensor::tensor::Tensor;
 use crate::kernels::naive::matmul_naive;
 use crate::kernels::tiled::matmul_tiled;
 use crate::kernels::tiled_mp::matmul_tiled_mp;
+use crate::tensor::tensor::Tensor;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -54,7 +54,10 @@ fn scheduler_config() -> &'static SchedulerConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(default_tiled_max);
 
-        SchedulerConfig { naive_max, tiled_max }
+        SchedulerConfig {
+            naive_max,
+            tiled_max,
+        }
     })
 }
 
@@ -106,10 +109,10 @@ fn load_kernel_profile_once() -> &'static Option<HashMap<usize, KernelType>> {
 // Encodes measured/assumed performance knowledge into system behavior.
 // `size` is the characteristic problem size (e.g. square matrix dimension).
 pub fn select_kernel(size: usize) -> KernelType {
-    if let Some(profile) = load_kernel_profile_once().as_ref() {
-        if let Some(&k) = profile.get(&size) {
-            return k;
-        }
+    if let Some(profile) = load_kernel_profile_once().as_ref()
+        && let Some(&k) = profile.get(&size)
+    {
+        return k;
     }
 
     let cfg = scheduler_config();
@@ -123,11 +126,7 @@ pub fn select_kernel(size: usize) -> KernelType {
     }
 }
 
-pub fn matmul(
-    a: &Tensor,
-    b: &Tensor,
-    kernel: KernelType,
-) -> Tensor {
+pub fn matmul(a: &Tensor, b: &Tensor, kernel: KernelType) -> Tensor {
     match kernel {
         KernelType::Naive => matmul_naive(a, b),
         KernelType::Tiled => matmul_tiled(a, b, 16),

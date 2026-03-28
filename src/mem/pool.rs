@@ -88,30 +88,29 @@ impl MemoryPool {
         let bytes = size
             .checked_mul(4)
             .expect("MemoryPool::get: size overflow when computing bytes");
-        if self.enabled {
-            if let Some(buffers) = self.free.get_mut(&size) {
-                if let Some(mut buffer) = buffers.pop() {
-                    self.reuses += 1;
+        if self.enabled
+            && let Some(buffers) = self.free.get_mut(&size)
+            && let Some(mut buffer) = buffers.pop()
+        {
+            self.reuses += 1;
 
-                    self.cached_memory = self
-                        .cached_memory
-                        .checked_sub(bytes)
-                        .expect("MemoryPool::get: cached_memory underflow");
+            self.cached_memory = self
+                .cached_memory
+                .checked_sub(bytes)
+                .expect("MemoryPool::get: cached_memory underflow");
 
-                    self.current_memory = self
-                        .current_memory
-                        .checked_add(bytes)
-                        .expect("MemoryPool::get: current_memory overflow");
+            self.current_memory = self
+                .current_memory
+                .checked_add(bytes)
+                .expect("MemoryPool::get: current_memory overflow");
 
-                    let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
-                    update_global_peak(global_after);
+            let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            update_global_peak(global_after);
 
-                    self.update_peaks();
+            self.update_peaks();
 
-                    buffer.fill(0.0);
-                    return buffer;
-                }
-            }
+            buffer.fill(0.0);
+            return buffer;
         }
 
         // Fresh allocation.
@@ -136,28 +135,27 @@ impl MemoryPool {
             .checked_mul(4)
             .expect("MemoryPool::get_no_clear: size overflow when computing bytes");
 
-        if self.enabled {
-            if let Some(buffers) = self.free.get_mut(&size) {
-                if let Some(buffer) = buffers.pop() {
-                    self.reuses += 1;
+        if self.enabled
+            && let Some(buffers) = self.free.get_mut(&size)
+            && let Some(buffer) = buffers.pop()
+        {
+            self.reuses += 1;
 
-                    self.cached_memory = self
-                        .cached_memory
-                        .checked_sub(bytes)
-                        .expect("MemoryPool::get_no_clear: cached_memory underflow");
+            self.cached_memory = self
+                .cached_memory
+                .checked_sub(bytes)
+                .expect("MemoryPool::get_no_clear: cached_memory underflow");
 
-                    self.current_memory = self
-                        .current_memory
-                        .checked_add(bytes)
-                        .expect("MemoryPool::get_no_clear: current_memory overflow");
+            self.current_memory = self
+                .current_memory
+                .checked_add(bytes)
+                .expect("MemoryPool::get_no_clear: current_memory overflow");
 
-                    let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
-                    update_global_peak(global_after);
-                    self.update_peaks();
+            let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            update_global_peak(global_after);
+            self.update_peaks();
 
-                    return buffer;
-                }
-            }
+            return buffer;
         }
 
         // Fresh allocation.
@@ -179,10 +177,9 @@ impl MemoryPool {
         let bytes = size
             .checked_mul(4)
             .expect("MemoryPool::release: size overflow when computing bytes");
-        self.current_memory = self
-            .current_memory
-            .checked_sub(bytes)
-            .expect("MemoryPool::release: current_memory underflow (released more than checked out)");
+        self.current_memory = self.current_memory.checked_sub(bytes).expect(
+            "MemoryPool::release: current_memory underflow (released more than checked out)",
+        );
 
         let global_before = GLOBAL_CURRENT_MEMORY.fetch_sub(bytes, Ordering::Relaxed);
         debug_assert!(
@@ -195,7 +192,7 @@ impl MemoryPool {
                 .cached_memory
                 .checked_add(bytes)
                 .expect("MemoryPool::release: cached_memory overflow");
-            self.free.entry(size).or_insert(Vec::new()).push(buffer);
+            self.free.entry(size).or_default().push(buffer);
             self.update_peaks();
         } else {
             // In baseline mode, released buffers are dropped.

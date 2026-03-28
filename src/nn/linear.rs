@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
 //y=mx+c this is the linear layer defination by changing the weights and bias we can change the line and fit it to the data
-use crate::tensor::store::TensorStore;
 use crate::autograd::graph::Graph;
 use crate::mem::pool::MemoryPool;
-use crate::tensor::tensor::{matmul_scheduled_with_pool, Tensor};
+use crate::tensor::store::TensorStore;
+use crate::tensor::tensor::{Tensor, matmul_scheduled_with_pool};
 
 pub struct Linear {
     pub weight_id: usize,
@@ -14,11 +14,7 @@ pub struct Linear {
 }
 
 impl Linear {
-    pub fn new(
-        in_features: usize,
-        out_features: usize,
-        store: &mut TensorStore,
-    ) -> Self {
+    pub fn new(in_features: usize, out_features: usize, store: &mut TensorStore) -> Self {
         // simple initialization (no fancy init yet) we will add Xavier or Kaiming later
         let weight_data = vec![0.5; in_features * out_features];
         let bias_data = vec![0.0; out_features];
@@ -48,7 +44,7 @@ impl Linear {
     ) -> usize {
         // ADDING x @ w
         let matmul_out = matmul_scheduled_with_pool(input_id, self.weight_id, store, graph, pool);
-        
+
         Tensor::add_with_pool(matmul_out, self.bias_id, store, graph, pool)
     }
 }

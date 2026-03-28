@@ -36,30 +36,30 @@ impl MPTransform {
         // C22 = M1 - M2 + M3 + M6
 
         let a_terms = vec![
-            vec![(0, 1.0), (3, 1.0)], // M1
-            vec![(2, 1.0), (3, 1.0)], // M2
-            vec![(0, 1.0)],           // M3
-            vec![(3, 1.0)],           // M4
-            vec![(0, 1.0), (1, 1.0)], // M5
+            vec![(0, 1.0), (3, 1.0)],  // M1
+            vec![(2, 1.0), (3, 1.0)],  // M2
+            vec![(0, 1.0)],            // M3
+            vec![(3, 1.0)],            // M4
+            vec![(0, 1.0), (1, 1.0)],  // M5
             vec![(2, 1.0), (0, -1.0)], // M6
             vec![(1, 1.0), (3, -1.0)], // M7
         ];
 
         let b_terms = vec![
-            vec![(0, 1.0), (3, 1.0)], // M1
-            vec![(0, 1.0)],           // M2
+            vec![(0, 1.0), (3, 1.0)],  // M1
+            vec![(0, 1.0)],            // M2
             vec![(1, 1.0), (3, -1.0)], // M3
             vec![(2, 1.0), (0, -1.0)], // M4
-            vec![(3, 1.0)],           // M5
-            vec![(0, 1.0), (1, 1.0)], // M6
-            vec![(2, 1.0), (3, 1.0)], // M7
+            vec![(3, 1.0)],            // M5
+            vec![(0, 1.0), (1, 1.0)],  // M6
+            vec![(2, 1.0), (3, 1.0)],  // M7
         ];
 
         let c_terms = vec![
             vec![(0, 1.0), (3, 1.0), (4, -1.0), (6, 1.0)], // C11
-            vec![(2, 1.0), (4, 1.0)],                       // C12
-            vec![(1, 1.0), (3, 1.0)],                       // C21
-            vec![(0, 1.0), (1, -1.0), (2, 1.0), (5, 1.0)],  // C22
+            vec![(2, 1.0), (4, 1.0)],                      // C12
+            vec![(1, 1.0), (3, 1.0)],                      // C21
+            vec![(0, 1.0), (1, -1.0), (2, 1.0), (5, 1.0)], // C22
         ];
 
         Self {
@@ -211,7 +211,14 @@ fn copy_block(src: &[f32], src_ld: usize, row0: usize, col0: usize, size: usize,
     }
 }
 
-fn add_block_into(dst: &mut [f32], dst_ld: usize, row0: usize, col0: usize, size: usize, src: &[f32]) {
+fn add_block_into(
+    dst: &mut [f32],
+    dst_ld: usize,
+    row0: usize,
+    col0: usize,
+    size: usize,
+    src: &[f32],
+) {
     debug_assert_eq!(src.len(), size * size);
     for i in 0..size {
         let dst_row = (row0 + i) * dst_ld + col0;
@@ -229,6 +236,7 @@ fn add_block_into(dst: &mut [f32], dst_ld: usize, row0: usize, col0: usize, size
 /// - C_block is at (c_row, c_col) in a matrix with leading dimension c_ld.
 ///
 /// Returns `true` if MP was applied, `false` if unsupported.
+#[allow(clippy::too_many_arguments)]
 pub fn mp_block_mul_add(
     a: &[f32],
     a_ld: usize,
@@ -246,7 +254,7 @@ pub fn mp_block_mul_add(
     transform: &MPTransform,
     scratch: &mut MPScratch,
 ) -> bool {
-    if block_size < 2 || block_size % 2 != 0 {
+    if block_size < 2 || !block_size.is_multiple_of(2) {
         return false;
     }
     if transform.mults() != 7 || transform.c_terms.len() != 4 {
@@ -259,11 +267,17 @@ pub fn mp_block_mul_add(
 
     // 1) Copy A and B quadrants into contiguous buffers.
     // A quads: (0,0),(0,h),(h,0),(h,h) within the block.
-    for (q, (dr, dc)) in [(0usize, 0usize), (0, h), (h, 0), (h, h)].into_iter().enumerate() {
+    for (q, (dr, dc)) in [(0usize, 0usize), (0, h), (h, 0), (h, h)]
+        .into_iter()
+        .enumerate()
+    {
         let dst = quad_slice_mut(s.a_quads, hh, q);
         copy_block(a, a_ld, a_row + dr, a_col + dc, h, dst);
     }
-    for (q, (dr, dc)) in [(0usize, 0usize), (0, h), (h, 0), (h, h)].into_iter().enumerate() {
+    for (q, (dr, dc)) in [(0usize, 0usize), (0, h), (h, 0), (h, h)]
+        .into_iter()
+        .enumerate()
+    {
         let dst = quad_slice_mut(s.b_quads, hh, q);
         copy_block(b, b_ld, b_row + dr, b_col + dc, h, dst);
     }
@@ -290,8 +304,8 @@ pub fn mp_block_mul_add(
     }
 
     let m_blocks: [&[f32]; 7] = [
-        &s.m[0 * hh..1 * hh],
-        &s.m[1 * hh..2 * hh],
+        &s.m[..hh],
+        &s.m[hh..2 * hh],
         &s.m[2 * hh..3 * hh],
         &s.m[3 * hh..4 * hh],
         &s.m[4 * hh..5 * hh],

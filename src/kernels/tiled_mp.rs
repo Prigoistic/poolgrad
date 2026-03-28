@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::kernels::mp::{mp_block_mul_add, MPTransform, MPScratch};
+use crate::kernels::mp::{MPScratch, MPTransform, mp_block_mul_add};
 use crate::kernels::tiled::matmul_tiled_into_slices;
 use crate::kernels::tiled::{
     matmul_tiled_add_into_slices_a_transposed, matmul_tiled_add_into_slices_b_transposed,
@@ -23,6 +23,7 @@ fn par_min_elems() -> usize {
         .unwrap_or(16 * 1024)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tiled_style_block_mul_accum(
     a: &[f32],
     a_ld: usize,
@@ -45,8 +46,7 @@ fn tiled_style_block_mul_accum(
             let out_idx = (c_row + i) * c_ld + (c_col + j);
             let mut sum = c[out_idx];
             for k in 0..n {
-                sum += a[(a_row + i) * a_ld + (a_col + k)]
-                    * b[(b_row + k) * b_ld + (b_col + j)];
+                sum += a[(a_row + i) * a_ld + (a_col + k)] * b[(b_row + k) * b_ld + (b_col + j)];
             }
             c[out_idx] = sum;
         }
@@ -125,21 +125,7 @@ pub fn matmul_tiled_mp_into_slices(
                         }
 
                         tiled_style_block_mul_accum(
-                            a,
-                            n,
-                            ii,
-                            kk,
-                            b,
-                            p,
-                            kk,
-                            jj,
-                            out_chunk,
-                            p,
-                            0,
-                            jj,
-                            bm,
-                            bn,
-                            bp,
+                            a, n, ii, kk, b, p, kk, jj, out_chunk, p, 0, jj, bm, bn, bp,
                         );
                     }
                 }
@@ -177,21 +163,7 @@ pub fn matmul_tiled_mp_into_slices(
                     }
 
                     tiled_style_block_mul_accum(
-                        a,
-                        n,
-                        ii,
-                        kk,
-                        b,
-                        p,
-                        kk,
-                        jj,
-                        out,
-                        p,
-                        ii,
-                        jj,
-                        bm,
-                        bn,
-                        bp,
+                        a, n, ii, kk, b, p, kk, jj, out, p, ii, jj, bm, bn, bp,
                     );
                 }
             }

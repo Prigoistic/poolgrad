@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use crate::autograd::graph::Graph;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct Lifetime {
