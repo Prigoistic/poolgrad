@@ -386,7 +386,8 @@ fn run_forward_backward_step_benchmark() {
             let a_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
             let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
             let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
-            graph.backward(&mut store, out_id, &mut pool);
+            let seed = vec![1.0; store.get(out_id).grad.len()];
+            graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
             release_intermediate_grads(&mut store, &graph, &mut pool, false);
         }
 
@@ -405,7 +406,8 @@ fn run_forward_backward_step_benchmark() {
             let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
 
             let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
-            graph.backward(&mut store, out_id, &mut pool);
+            let seed = vec![1.0; store.get(out_id).grad.len()];
+            graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
             release_intermediate_grads(&mut store, &graph, &mut pool, false);
 
             samples.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -490,7 +492,8 @@ fn run_kernel_pool_interaction_experiment() -> usize {
             let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
 
             let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
-            graph.backward(&mut store, out_id, &mut pool);
+            let seed = vec![1.0; store.get(out_id).grad.len()];
+            graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
             release_intermediate_grads(&mut store, &graph, &mut pool, false);
         }
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;

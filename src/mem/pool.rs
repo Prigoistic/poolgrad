@@ -128,6 +128,7 @@ impl MemoryPool {
         vec![0.0; size]
     }
 
+    #[allow(dead_code)]
     pub fn get_no_clear(&mut self, size: usize) -> Vec<f32> {
         // Identical accounting to `get`, but does not clear reused buffers.
         // Only use when the caller overwrites every element before reading.
