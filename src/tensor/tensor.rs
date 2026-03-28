@@ -134,7 +134,8 @@ impl Tensor {
     let out_id = store.add(result_tensor);
 
     let node = Node {
-        inputs: vec![a_id, b_id],
+        input0: a_id,
+        input1: Some(b_id),
         output: out_id,
         op: Operation::Add,
     };
@@ -185,7 +186,8 @@ impl Tensor {
         let out_id = store.add(result_tensor);
 
         let node = Node {
-            inputs: vec![a_id, b_id],
+            input0: a_id,
+            input1: Some(b_id),
             output: out_id,
             op: Operation::Add,
         };
@@ -276,7 +278,8 @@ pub fn mul(a_id: usize, b_id: usize, store: &mut TensorStore, graph: &mut Graph)
     let out_id = store.add(result_tensor);
 
     let node = Node {
-        inputs: vec![a_id, b_id],
+        input0: a_id,
+        input1: Some(b_id),
         output: out_id,
         op: Operation::Mul,
     };
@@ -330,7 +333,8 @@ pub fn matmul(a_id: usize, b_id: usize, store: &mut TensorStore, graph: &mut Gra
     let out_id = store.add(result_tensor);
 
     let node = Node {
-        inputs: vec![a_id, b_id],
+        input0: a_id,
+        input1: Some(b_id),
         output: out_id,
         op: Operation::MatMul,
     };
@@ -384,7 +388,8 @@ pub fn matmul_scheduled_with_pool(
     let out_id = store.add(result_tensor);
 
     let node = Node {
-        inputs: vec![a_id, b_id],
+        input0: a_id,
+        input1: Some(b_id),
         output: out_id,
         op: Operation::MatMul,
     };
@@ -410,7 +415,8 @@ pub fn relu(input_id: usize, store: &mut TensorStore, graph: &mut Graph) -> usiz
     let out_id = store.add(result);
 
     let node = Node {
-        inputs: vec![input_id],
+        input0: input_id,
+        input1: None,
         output: out_id,
         op: Operation::ReLU,
     };

@@ -23,9 +23,18 @@ pub fn compute_lifetimes(graph: &Graph) -> HashMap<usize, Lifetime> {
             });
 
         // INPUT tensors → update death
-        for &input in &node.inputs {
+        let input0 = node.input0;
+        lifetimes
+            .entry(input0)
+            .and_modify(|l| l.death = l.death.max(step))
+            .or_insert(Lifetime {
+                birth: 0,
+                death: step,
+            });
+
+        if let Some(input1) = node.input1 {
             lifetimes
-                .entry(input)
+                .entry(input1)
                 .and_modify(|l| l.death = l.death.max(step))
                 .or_insert(Lifetime {
                     birth: 0,

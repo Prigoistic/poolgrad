@@ -36,7 +36,8 @@ pub fn mse(
     let loss_id = store.add(loss);
 
     let node = Node {
-        inputs: vec![pred_id, target_id],
+        input0: pred_id,
+        input1: Some(target_id),
         output: loss_id,
         op: Operation::MSE,
     };

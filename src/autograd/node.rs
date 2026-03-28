@@ -2,7 +2,8 @@
 
 #[allow(dead_code)]
 pub struct Node {
-    pub inputs: Vec<usize>,
+    pub input0: usize,
+    pub input1: Option<usize>,
     pub output: usize,
     pub op: Operation,
 
