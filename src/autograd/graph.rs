@@ -2,15 +2,9 @@ use crate::autograd::node::{Node, Operation};
 use crate::mem::pool::MemoryPool;
 use crate::tensor::store::TensorStore;
 
-use crate::kernels::naive::{
-    matmul_naive_add_into_slices_a_transposed, matmul_naive_add_into_slices_b_transposed,
-};
-use crate::kernels::selector::{KernelType, select_kernel};
-use crate::kernels::tiled::{
-    matmul_tiled_add_into_slices_a_transposed, matmul_tiled_add_into_slices_b_transposed,
-};
-use crate::kernels::tiled_mp::{
-    matmul_tiled_mp_add_into_slices_a_transposed, matmul_tiled_mp_add_into_slices_b_transposed,
+use crate::kernels::selector::{
+    KernelType, matmul_add_into_slices_a_transposed, matmul_add_into_slices_b_transposed,
+    select_kernel_mm,
 };
 
 use std::collections::HashMap;
@@ -139,6 +133,7 @@ impl Graph {
         }
 
         // Cache kernel selection for repeated MatMul shapes within this backward pass.
+        // Key: (m, k, n) where output is (m x n) and reduction is k.
         let mut matmul_kernel_cache: HashMap<(usize, usize, usize), KernelType> = HashMap::new();
 
         for node in self.nodes.iter().rev() {
@@ -328,74 +323,36 @@ impl Graph {
                         assert_eq!(out.grad.len(), m * p, "Output grad has wrong size");
 
                         if a_req {
-                            let kernel = *matmul_kernel_cache
-                                .entry((m, n, p))
-                                .or_insert_with(|| select_kernel(m.max(n).max(p)));
+                            let mut get_kernel = |mm: usize, kk: usize, nn: usize| {
+                                *matmul_kernel_cache
+                                    .entry((mm, kk, nn))
+                                    .or_insert_with(|| select_kernel_mm(mm, kk, nn))
+                            };
                             let d_c = out.grad.as_slice();
 
                             // Term 1: dC @ A^T
-                            match kernel {
-                                KernelType::Naive => matmul_naive_add_into_slices_b_transposed(
-                                    d_c,
-                                    m,
-                                    p,
-                                    &a.data,
-                                    n,
-                                    &mut a.grad,
-                                ),
-                                KernelType::Tiled => matmul_tiled_add_into_slices_b_transposed(
-                                    d_c,
-                                    m,
-                                    p,
-                                    &a.data,
-                                    n,
-                                    &mut a.grad,
-                                    16,
-                                ),
-                                KernelType::TiledMP => {
-                                    matmul_tiled_mp_add_into_slices_b_transposed(
-                                        d_c,
-                                        m,
-                                        p,
-                                        &a.data,
-                                        n,
-                                        &mut a.grad,
-                                        16,
-                                    )
-                                }
-                            }
+                            let k1 = get_kernel(m, p, n);
+                            matmul_add_into_slices_b_transposed(
+                                k1,
+                                d_c,
+                                m,
+                                p,
+                                &a.data,
+                                n,
+                                &mut a.grad,
+                            );
 
                             // Term 2: A^T @ dC
-                            match kernel {
-                                KernelType::Naive => matmul_naive_add_into_slices_a_transposed(
-                                    &a.data,
-                                    m,
-                                    n,
-                                    d_c,
-                                    p,
-                                    &mut a.grad,
-                                ),
-                                KernelType::Tiled => matmul_tiled_add_into_slices_a_transposed(
-                                    &a.data,
-                                    m,
-                                    n,
-                                    d_c,
-                                    p,
-                                    &mut a.grad,
-                                    16,
-                                ),
-                                KernelType::TiledMP => {
-                                    matmul_tiled_mp_add_into_slices_a_transposed(
-                                        &a.data,
-                                        m,
-                                        n,
-                                        d_c,
-                                        p,
-                                        &mut a.grad,
-                                        16,
-                                    )
-                                }
-                            }
+                            let k2 = get_kernel(n, m, p);
+                            matmul_add_into_slices_a_transposed(
+                                k2,
+                                &a.data,
+                                m,
+                                n,
+                                d_c,
+                                p,
+                                &mut a.grad,
+                            );
                         }
 
                         continue;
@@ -427,73 +384,40 @@ impl Graph {
                     let p = b.shape[1];
                     assert_eq!(out.grad.len(), m * p, "Output grad has wrong size");
 
-                    let kernel = *matmul_kernel_cache
-                        .entry((m, n, p))
-                        .or_insert_with(|| select_kernel(m.max(n).max(p)));
                     let d_c = out.grad.as_slice();
+
+                    let mut get_kernel = |mm: usize, kk: usize, nn: usize| {
+                        *matmul_kernel_cache
+                            .entry((mm, kk, nn))
+                            .or_insert_with(|| select_kernel_mm(mm, kk, nn))
+                    };
 
                     if a_req {
                         // dA = dC @ B^T
-                        match kernel {
-                            KernelType::Naive => matmul_naive_add_into_slices_b_transposed(
-                                d_c,
-                                m,
-                                p,
-                                &b.data,
-                                n,
-                                &mut a.grad,
-                            ),
-                            KernelType::Tiled => matmul_tiled_add_into_slices_b_transposed(
-                                d_c,
-                                m,
-                                p,
-                                &b.data,
-                                n,
-                                &mut a.grad,
-                                16,
-                            ),
-                            KernelType::TiledMP => matmul_tiled_mp_add_into_slices_b_transposed(
-                                d_c,
-                                m,
-                                p,
-                                &b.data,
-                                n,
-                                &mut a.grad,
-                                16,
-                            ),
-                        }
+                        let k_da = get_kernel(m, p, n);
+                        matmul_add_into_slices_b_transposed(
+                            k_da,
+                            d_c,
+                            m,
+                            p,
+                            &b.data,
+                            n,
+                            &mut a.grad,
+                        );
                     }
 
                     if b_req {
                         // dB = A^T @ dC
-                        match kernel {
-                            KernelType::Naive => matmul_naive_add_into_slices_a_transposed(
-                                &a.data,
-                                m,
-                                n,
-                                d_c,
-                                p,
-                                &mut b.grad,
-                            ),
-                            KernelType::Tiled => matmul_tiled_add_into_slices_a_transposed(
-                                &a.data,
-                                m,
-                                n,
-                                d_c,
-                                p,
-                                &mut b.grad,
-                                16,
-                            ),
-                            KernelType::TiledMP => matmul_tiled_mp_add_into_slices_a_transposed(
-                                &a.data,
-                                m,
-                                n,
-                                d_c,
-                                p,
-                                &mut b.grad,
-                                16,
-                            ),
-                        }
+                        let k_db = get_kernel(n, m, p);
+                        matmul_add_into_slices_a_transposed(
+                            k_db,
+                            &a.data,
+                            m,
+                            n,
+                            d_c,
+                            p,
+                            &mut b.grad,
+                        );
                     }
                 }
 

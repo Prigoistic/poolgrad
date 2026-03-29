@@ -9,9 +9,9 @@ use std::time::Instant;
 
 use autograd::graph::Graph;
 use kernels::naive::matmul_naive;
-use kernels::selector::select_kernel;
+use kernels::selector::select_kernel_mm;
 use kernels::selector::{KernelType, matmul as matmul_by_kernel};
-use kernels::tiled::matmul_tiled;
+use kernels::tiled::{matmul_tiled, matmul_tiled_packed};
 use mem::pool::MemoryPool;
 use nn::linear::Linear;
 use nn::loss::mse;
@@ -225,6 +225,7 @@ fn validate_kernels() {
 
         for (kernel, name) in [
             (KernelType::Tiled, "Tiled"),
+            (KernelType::TiledPacked, "TiledPk"),
             (KernelType::TiledMP, "TiledMP"),
         ] {
             let out = matmul_by_kernel(&a, &b, kernel);
@@ -283,10 +284,10 @@ fn run_kernel_benchmark() {
         seed, warmup, trials
     );
     println!(
-        "Size | Naive_med | Naive_p95 | Tiled_med | Tiled_p95 | TiledMP_med | TiledMP_p95 | Winner  | Scheduler"
+        "Size | Naive_med | Naive_p95 | Tiled_med | Tiled_p95 | TPk_med  | TPk_p95  | TiledMP_med | TiledMP_p95 | Winner   | Scheduler"
     );
     println!(
-        "-----|----------|----------|----------|----------|------------|------------|---------|----------"
+        "-----|----------|----------|----------|----------|---------|---------|------------|------------|----------|----------"
     );
 
     let mut winners: Vec<(usize, KernelType)> = Vec::new();
@@ -321,6 +322,22 @@ fn run_kernel_benchmark() {
             trials,
         );
 
+        let tiled_pk_out = matmul_tiled_packed(&a, &b, 16);
+        let tiled_pk_err = max_abs_diff(&reference.data, &tiled_pk_out.data);
+        assert!(
+            tiled_pk_err < 1e-4,
+            "TiledPacked failed validation at size {}: err={}",
+            size,
+            tiled_pk_err
+        );
+        let (tiled_pk_med, tiled_pk_p95) = bench_ms(
+            || {
+                let _ = matmul_tiled_packed(&a, &b, 16);
+            },
+            warmup,
+            trials,
+        );
+
         let tiled_mp_out = kernels::tiled_mp::matmul_tiled_mp(&a, &b, 16);
         let tiled_mp_err = max_abs_diff(&reference.data, &tiled_mp_out.data);
         assert!(
@@ -337,23 +354,28 @@ fn run_kernel_benchmark() {
             trials,
         );
 
-        let (winner_label, winner_kernel) = if tiled_med <= naive_med && tiled_med <= tiled_mp_med {
-            ("Tiled", KernelType::Tiled)
-        } else if tiled_mp_med <= naive_med && tiled_mp_med <= tiled_med {
-            ("TiledMP", KernelType::TiledMP)
-        } else {
-            ("Naive", KernelType::Naive)
-        };
+        let (winner_label, winner_kernel) =
+            if naive_med <= tiled_med && naive_med <= tiled_pk_med && naive_med <= tiled_mp_med {
+                ("Naive", KernelType::Naive)
+            } else if tiled_med <= tiled_pk_med && tiled_med <= tiled_mp_med {
+                ("Tiled", KernelType::Tiled)
+            } else if tiled_pk_med <= tiled_mp_med {
+                ("TiledPk", KernelType::TiledPacked)
+            } else {
+                ("TiledMP", KernelType::TiledMP)
+            };
 
-        let scheduled = select_kernel(size);
+        let scheduled = select_kernel_mm(size, size, size);
 
         println!(
-            "{:>4} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>10.3} | {:>10.3} | {:<7} | {:?}",
+            "{:>4} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>7.3} | {:>7.3} | {:>10.3} | {:>10.3} | {:<8} | {:?}",
             size,
             naive_med,
             naive_p95,
             tiled_med,
             tiled_p95,
+            tiled_pk_med,
+            tiled_pk_p95,
             tiled_mp_med,
             tiled_mp_p95,
             winner_label,
@@ -402,7 +424,7 @@ fn run_forward_backward_step_benchmark() {
     println!("-----|--------|---------|---------|---------|------------");
 
     for &size in &sizes {
-        let kernel = select_kernel(size);
+        let kernel = select_kernel_mm(size, size, size);
         let mut pool = MemoryPool::new();
         pool.enabled = true;
 
@@ -511,7 +533,7 @@ fn run_kernel_pool_interaction_experiment() -> usize {
 
     for &size in &sizes {
         let iters = if size <= 128 { 10usize } else { 3usize };
-        let kernel: KernelType = select_kernel(size);
+        let kernel: KernelType = select_kernel_mm(size, size, size);
 
         let alloc0 = pool.allocations;
         let reuse0 = pool.reuses;

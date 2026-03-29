@@ -5,9 +5,7 @@ use std::fmt;
 use crate::autograd::graph::Graph;
 use crate::autograd::node::{Node, Operation};
 
-use crate::kernels::naive::matmul_naive_into;
-use crate::kernels::selector::{KernelType, select_kernel};
-use crate::kernels::tiled::matmul_tiled_into;
+use crate::kernels::selector::{matmul_into, select_kernel_mm};
 use crate::mem::pool::MemoryPool;
 use crate::tensor::store::TensorStore;
 
@@ -379,17 +377,10 @@ pub fn matmul_scheduled_with_pool(
     let (m, n) = (a.shape[0], a.shape[1]);
     let p = b.shape[1];
 
-    let size_hint = m.max(n).max(p);
-    let kernel = select_kernel(size_hint);
+    let kernel = select_kernel_mm(m, n, p);
 
     let mut result_data = vec![0.0; m * p];
-    match kernel {
-        KernelType::Naive => matmul_naive_into(a, b, &mut result_data),
-        KernelType::Tiled => matmul_tiled_into(a, b, &mut result_data, 16),
-        KernelType::TiledMP => {
-            crate::kernels::tiled_mp::matmul_tiled_mp_into(a, b, &mut result_data, 16)
-        }
-    }
+    matmul_into(a, b, kernel, &mut result_data);
 
     let requires_grad = a.requires_grad || b.requires_grad;
     let grad = if requires_grad {
