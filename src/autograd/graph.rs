@@ -523,7 +523,25 @@ mod tests {
     use super::Graph;
     use crate::mem::pool::MemoryPool;
     use crate::tensor::store::TensorStore;
-    use crate::tensor::tensor::{Tensor, matmul, relu};
+    use crate::tensor::tensor::{Tensor, matmul, mul, relu};
+
+    fn loss_sum(output: &[f32]) -> f32 {
+        output.iter().copied().sum::<f32>()
+    }
+
+    fn finite_diff_grad(mut x: Vec<f32>, eps: f32, f: impl Fn(&[f32]) -> f32) -> Vec<f32> {
+        let mut g = vec![0.0; x.len()];
+        for i in 0..x.len() {
+            let orig = x[i];
+            x[i] = orig + eps;
+            let f_pos = f(&x);
+            x[i] = orig - eps;
+            let f_neg = f(&x);
+            x[i] = orig;
+            g[i] = (f_pos - f_neg) / (2.0 * eps);
+        }
+        g
+    }
 
     #[test]
     fn matmul_backward_matches_sums_when_loss_grad_is_ones() {
@@ -572,5 +590,282 @@ mod tests {
 
         // dy/dx is 0 for x<=0, 1 for x>0 (with upstream grad = 1)
         assert_eq!(store.get(x_id).grad, vec![0.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn finite_diff_add_grad_matches_backward() {
+        let eps = 1e-3f32;
+        let tol = 2e-2f32;
+
+        let a0 = vec![0.2, -1.1, 0.7, 1.3, -0.4, 2.0];
+        let b0 = vec![1.0, 0.5, -0.3, 0.2, 0.9, -1.7];
+
+        // Analytic grad via autograd
+        let mut store = TensorStore::new();
+        let mut graph = Graph::new();
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
+
+        let a_id = store.add(Tensor::new(a0.clone(), vec![2, 3], true));
+        let b_id = store.add(Tensor::new(b0.clone(), vec![2, 3], true));
+        let out_id = Tensor::add(a_id, b_id, &mut store, &mut graph);
+
+        let seed = vec![1.0; store.get(out_id).data.len()];
+        graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
+
+        let ga = store.get(a_id).grad.clone();
+        let gb = store.get(b_id).grad.clone();
+
+        // Numeric grad (loss = sum(out))
+        let f_a = |a: &[f32]| {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let a_id = store.add(Tensor::new(a.to_vec(), vec![2, 3], true));
+            let b_id = store.add(Tensor::new(b0.clone(), vec![2, 3], true));
+            let out_id = Tensor::add(a_id, b_id, &mut store, &mut graph);
+            loss_sum(&store.get(out_id).data)
+        };
+        let f_b = |b: &[f32]| {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let a_id = store.add(Tensor::new(a0.clone(), vec![2, 3], true));
+            let b_id = store.add(Tensor::new(b.to_vec(), vec![2, 3], true));
+            let out_id = Tensor::add(a_id, b_id, &mut store, &mut graph);
+            loss_sum(&store.get(out_id).data)
+        };
+
+        let nga = finite_diff_grad(a0.clone(), eps, f_a);
+        let ngb = finite_diff_grad(b0.clone(), eps, f_b);
+
+        for i in 0..ga.len() {
+            assert!(
+                (ga[i] - nga[i]).abs() < tol,
+                "dA[{}]: {} vs {}",
+                i,
+                ga[i],
+                nga[i]
+            );
+            assert!(
+                (gb[i] - ngb[i]).abs() < tol,
+                "dB[{}]: {} vs {}",
+                i,
+                gb[i],
+                ngb[i]
+            );
+        }
+    }
+
+    #[test]
+    fn finite_diff_mul_grad_matches_backward() {
+        let eps = 1e-3f32;
+        let tol = 2e-2f32;
+
+        let a0 = vec![0.2, -1.1, 0.7, 1.3, -0.4, 2.0];
+        let b0 = vec![1.0, 0.5, -0.3, 0.2, 0.9, -1.7];
+
+        // Analytic grad via autograd
+        let mut store = TensorStore::new();
+        let mut graph = Graph::new();
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
+
+        let a_id = store.add(Tensor::new(a0.clone(), vec![2, 3], true));
+        let b_id = store.add(Tensor::new(b0.clone(), vec![2, 3], true));
+        let out_id = mul(a_id, b_id, &mut store, &mut graph);
+
+        let seed = vec![1.0; store.get(out_id).data.len()];
+        graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
+
+        let ga = store.get(a_id).grad.clone();
+        let gb = store.get(b_id).grad.clone();
+
+        // Numeric grad (loss = sum(out))
+        let f_a = |a: &[f32]| {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let a_id = store.add(Tensor::new(a.to_vec(), vec![2, 3], true));
+            let b_id = store.add(Tensor::new(b0.clone(), vec![2, 3], true));
+            let out_id = mul(a_id, b_id, &mut store, &mut graph);
+            loss_sum(&store.get(out_id).data)
+        };
+        let f_b = |b: &[f32]| {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let a_id = store.add(Tensor::new(a0.clone(), vec![2, 3], true));
+            let b_id = store.add(Tensor::new(b.to_vec(), vec![2, 3], true));
+            let out_id = mul(a_id, b_id, &mut store, &mut graph);
+            loss_sum(&store.get(out_id).data)
+        };
+
+        let nga = finite_diff_grad(a0.clone(), eps, f_a);
+        let ngb = finite_diff_grad(b0.clone(), eps, f_b);
+
+        for i in 0..ga.len() {
+            assert!(
+                (ga[i] - nga[i]).abs() < tol,
+                "dA[{}]: {} vs {}",
+                i,
+                ga[i],
+                nga[i]
+            );
+            assert!(
+                (gb[i] - ngb[i]).abs() < tol,
+                "dB[{}]: {} vs {}",
+                i,
+                gb[i],
+                ngb[i]
+            );
+        }
+    }
+
+    #[test]
+    fn finite_diff_matmul_rectangular_grad_matches_backward() {
+        let eps = 1e-3f32;
+        let tol = 5e-2f32;
+
+        // A: 2x3, B: 3x4 => C: 2x4
+        let a0 = vec![0.5, -0.2, 1.1, 0.7, 0.3, -0.9];
+        let b0 = vec![
+            0.4, -1.2, 0.8, 0.1, 0.7, 0.3, -0.5, 1.0, -0.6, 0.2, 0.9, -0.4,
+        ];
+
+        // Analytic grad via autograd
+        let mut store = TensorStore::new();
+        let mut graph = Graph::new();
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
+
+        let a_id = store.add(Tensor::new(a0.clone(), vec![2, 3], true));
+        let b_id = store.add(Tensor::new(b0.clone(), vec![3, 4], true));
+        let out_id = matmul(a_id, b_id, &mut store, &mut graph);
+
+        let seed = vec![1.0; store.get(out_id).data.len()];
+        graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
+
+        let ga = store.get(a_id).grad.clone();
+        let gb = store.get(b_id).grad.clone();
+
+        // Numeric grad (loss = sum(out))
+        let f_a = |a: &[f32]| {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let a_id = store.add(Tensor::new(a.to_vec(), vec![2, 3], true));
+            let b_id = store.add(Tensor::new(b0.clone(), vec![3, 4], true));
+            let out_id = matmul(a_id, b_id, &mut store, &mut graph);
+            loss_sum(&store.get(out_id).data)
+        };
+        let f_b = |b: &[f32]| {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let a_id = store.add(Tensor::new(a0.clone(), vec![2, 3], true));
+            let b_id = store.add(Tensor::new(b.to_vec(), vec![3, 4], true));
+            let out_id = matmul(a_id, b_id, &mut store, &mut graph);
+            loss_sum(&store.get(out_id).data)
+        };
+
+        let nga = finite_diff_grad(a0.clone(), eps, f_a);
+        let ngb = finite_diff_grad(b0.clone(), eps, f_b);
+
+        for i in 0..ga.len() {
+            assert!(
+                (ga[i] - nga[i]).abs() < tol,
+                "dA[{}]: {} vs {}",
+                i,
+                ga[i],
+                nga[i]
+            );
+        }
+        for i in 0..gb.len() {
+            assert!(
+                (gb[i] - ngb[i]).abs() < tol,
+                "dB[{}]: {} vs {}",
+                i,
+                gb[i],
+                ngb[i]
+            );
+        }
+    }
+
+    #[test]
+    fn finite_diff_relu_grad_matches_backward() {
+        let eps = 1e-3f32;
+        let tol = 2e-2f32;
+
+        let x0 = vec![-1.2, 0.7, 2.3, -0.4];
+
+        // Analytic grad via autograd
+        let mut store = TensorStore::new();
+        let mut graph = Graph::new();
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
+
+        let x_id = store.add(Tensor::new(x0.clone(), vec![4], true));
+        let out_id = relu(x_id, &mut store, &mut graph);
+        let seed = vec![1.0; store.get(out_id).data.len()];
+        graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
+        let gx = store.get(x_id).grad.clone();
+
+        // Numeric grad (loss = sum(out))
+        let f_x = |x: &[f32]| {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let x_id = store.add(Tensor::new(x.to_vec(), vec![4], true));
+            let out_id = relu(x_id, &mut store, &mut graph);
+            loss_sum(&store.get(out_id).data)
+        };
+        let ngx = finite_diff_grad(x0, eps, f_x);
+
+        for i in 0..gx.len() {
+            assert!(
+                (gx[i] - ngx[i]).abs() < tol,
+                "dX[{}]: {} vs {}",
+                i,
+                gx[i],
+                ngx[i]
+            );
+        }
+    }
+
+    #[test]
+    fn finite_diff_reuse_tensor_multiple_times_in_graph() {
+        let eps = 1e-3f32;
+        let tol = 5e-2f32;
+
+        // y = x * x + x, loss = sum(y)
+        let x0 = vec![0.3, -0.8, 1.5, 0.2];
+
+        // Analytic grad via autograd
+        let mut store = TensorStore::new();
+        let mut graph = Graph::new();
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
+
+        let x_id = store.add(Tensor::new(x0.clone(), vec![4], true));
+        let y_id = mul(x_id, x_id, &mut store, &mut graph);
+        let z_id = Tensor::add(y_id, x_id, &mut store, &mut graph);
+        let seed = vec![1.0; store.get(z_id).data.len()];
+        graph.backward_seeded(&mut store, z_id, &seed, &mut pool);
+        let gx = store.get(x_id).grad.clone();
+
+        // Numeric grad
+        let f_x = |x: &[f32]| {
+            let mut store = TensorStore::new();
+            let mut graph = Graph::new();
+            let x_id = store.add(Tensor::new(x.to_vec(), vec![4], true));
+            let y_id = mul(x_id, x_id, &mut store, &mut graph);
+            let z_id = Tensor::add(y_id, x_id, &mut store, &mut graph);
+            loss_sum(&store.get(z_id).data)
+        };
+        let ngx = finite_diff_grad(x0, eps, f_x);
+
+        for i in 0..gx.len() {
+            assert!(
+                (gx[i] - ngx[i]).abs() < tol,
+                "dX[{}]: {} vs {}",
+                i,
+                gx[i],
+                ngx[i]
+            );
+        }
     }
 }

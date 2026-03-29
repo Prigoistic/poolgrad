@@ -46,6 +46,9 @@ impl Tensor {
             Vec::new()
         };
 
+        debug_assert!(requires_grad || grad.is_empty());
+        debug_assert!(!requires_grad || grad.len() == data.len());
+
         Self {
             id: 0,
             data,
@@ -71,6 +74,9 @@ impl Tensor {
         } else {
             Vec::new()
         };
+
+        debug_assert!(requires_grad || grad.is_empty());
+        debug_assert!(!requires_grad || grad.len() == data.len());
 
         Self {
             id: 0,
@@ -168,8 +174,10 @@ impl Tensor {
         let grad = if requires_grad {
             pool.get(a.data.len())
         } else {
-            vec![0.0; a.data.len()]
+            Vec::new()
         };
+
+        assert!(requires_grad || grad.is_empty());
 
         let result_tensor = Tensor {
             id: 0, // temporary
@@ -197,7 +205,8 @@ impl Tensor {
         out_id
     }
 
-    pub fn mul(&self, other: &Tensor) -> Tensor {
+    /// WARNING: does NOT build an autograd graph.
+    pub fn mul_no_grad(&self, other: &Tensor) -> Tensor {
         assert_eq!(
             self.shape, other.shape,
             "Shapes must be the same for multiplication"
@@ -217,7 +226,15 @@ impl Tensor {
         )
     }
 
-    pub fn matmul(&self, other: &Tensor) -> Tensor {
+    #[deprecated(
+        note = "Tensor::mul does not build an autograd graph; use the graph-building free function `tensor::tensor::mul` or call `mul_no_grad` explicitly"
+    )]
+    pub fn mul(&self, other: &Tensor) -> Tensor {
+        self.mul_no_grad(other)
+    }
+
+    /// WARNING: does NOT build an autograd graph.
+    pub fn matmul_no_grad(&self, other: &Tensor) -> Tensor {
         assert_eq!(self.shape.len(), 2, "First tensor must be 2D for matmul");
         assert_eq!(other.shape.len(), 2, "Second tensor must be 2D for matmul");
         assert_eq!(
@@ -247,6 +264,13 @@ impl Tensor {
             vec![m, p],
             self.requires_grad || other.requires_grad,
         )
+    }
+
+    #[deprecated(
+        note = "Tensor::matmul does not build an autograd graph; use `matmul_scheduled_with_pool` (preferred) or call `matmul_no_grad` explicitly"
+    )]
+    pub fn matmul(&self, other: &Tensor) -> Tensor {
+        self.matmul_no_grad(other)
     }
 }
 

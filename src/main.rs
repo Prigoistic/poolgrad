@@ -10,7 +10,7 @@ use std::time::Instant;
 use autograd::graph::Graph;
 use kernels::naive::matmul_naive;
 use kernels::selector::select_kernel_mm;
-use kernels::selector::{KernelType, matmul as matmul_by_kernel};
+use kernels::selector::{KernelType, matmul_no_grad as matmul_by_kernel};
 use kernels::tiled::{matmul_tiled, matmul_tiled_packed};
 use mem::pool::MemoryPool;
 use nn::linear::Linear;
@@ -51,12 +51,20 @@ fn run_training(config: &Config) -> MemoryPool {
     let mut graph = Graph::new();
     let mut pool = MemoryPool::new();
     pool.enabled = config.use_pool;
-    let x_id = store.add(Tensor::new(vec![1.0, 2.0], vec![1, 2], true));
-    let target_id = store.add(Tensor::new(vec![3.0, 3.0, 3.0], vec![1, 3], false));
+    let mut x_id = store.add(Tensor::new(vec![1.0, 2.0], vec![1, 2], true));
+    let mut target_id = store.add(Tensor::new(vec![3.0, 3.0, 3.0], vec![1, 3], false));
 
-    let linear = Linear::new(2, 3, &mut store);
+    let mut linear = Linear::new(2, 3, &mut store);
 
     for epoch in 0..10 {
+        // Bounded memory: we keep only persistent tensors in the store across epochs.
+        // (inputs + targets + parameters)
+        debug_assert_eq!(
+            store.tensors.len(),
+            4,
+            "TensorStore grew across epochs; expected only persistent tensors"
+        );
+
         // forward
         let out_id = linear.forward(x_id, &mut store, &mut graph, &mut pool);
         let loss_id = mse(out_id, target_id, &mut store, &mut graph, &mut pool);
@@ -88,11 +96,36 @@ fn run_training(config: &Config) -> MemoryPool {
 
         release_intermediate_grads(&mut store, &graph, &mut pool, config.verbose && epoch == 9);
 
-        // reset graph + grads (IMPORTANT)
-        graph.nodes.clear();
-        for t in &mut store.tensors {
-            t.zero_grad();
-        }
+        // CRITICAL: Rebuild store+graph each epoch to avoid unbounded TensorStore growth.
+        // Keep the persistent tensors (x, target, weights, bias) and drop ephemerals.
+        // NOTE: Intermediate grad buffers are returned to the pool by `release_intermediate_grads`.
+        let mut old = std::mem::take(&mut store.tensors);
+
+        // Extract persistent tensors by id. Remove in descending order to keep indices valid.
+        let mut bias = old.swap_remove(linear.bias_id);
+        let mut weight = old.swap_remove(linear.weight_id);
+        let mut target = old.swap_remove(target_id);
+        let mut x = old.swap_remove(x_id);
+
+        // Ensure persistent tensors look like true leafs.
+        x.creator = None;
+        target.creator = None;
+        weight.creator = None;
+        bias.creator = None;
+
+        x.zero_grad();
+        weight.zero_grad();
+        bias.zero_grad();
+
+        drop(old);
+
+        store = TensorStore::new();
+        graph = Graph::new();
+
+        x_id = store.add(x);
+        target_id = store.add(target);
+        linear.weight_id = store.add(weight);
+        linear.bias_id = store.add(bias);
     }
 
     pool

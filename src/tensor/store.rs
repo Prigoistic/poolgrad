@@ -12,6 +12,26 @@ impl TensorStore {
     }
 
     pub fn add(&mut self, mut tensor: Tensor) -> usize {
+        let size: usize = tensor.shape.iter().product();
+        assert_eq!(
+            tensor.data.len(),
+            size,
+            "TensorStore::add: shape does not match data length"
+        );
+
+        if tensor.requires_grad {
+            assert_eq!(
+                tensor.grad.len(),
+                tensor.data.len(),
+                "TensorStore::add: requires_grad=true but grad len != data len"
+            );
+        } else {
+            assert!(
+                tensor.grad.is_empty(),
+                "TensorStore::add: requires_grad=false but grad is non-empty"
+            );
+        }
+
         let id = self.tensors.len();
         tensor.id = id;
         self.tensors.push(tensor);

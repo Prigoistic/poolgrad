@@ -22,14 +22,17 @@ pub fn mse(
         "mse: pred and target must have the same number of elements"
     );
 
-    let diff_data: Vec<f32> = pred
+    let len = pred.data.len();
+    let mean = pred
         .data
         .iter()
-        .zip(target.data.iter())
-        .map(|(p, t)| (p - t) * (p - t))
-        .collect();
-
-    let mean = diff_data.iter().sum::<f32>() / diff_data.len() as f32;
+        .zip(&target.data)
+        .map(|(p, t)| {
+            let d = p - t;
+            d * d
+        })
+        .sum::<f32>()
+        / len as f32;
 
     let loss = Tensor::new_with_pool(vec![mean], vec![1], true, pool);
 

@@ -226,13 +226,21 @@ pub fn select_kernel_mm(m: usize, n: usize, p: usize) -> KernelType {
     }
 }
 
-pub fn matmul(a: &Tensor, b: &Tensor, kernel: KernelType) -> Tensor {
+/// WARNING: does NOT build an autograd graph.
+pub fn matmul_no_grad(a: &Tensor, b: &Tensor, kernel: KernelType) -> Tensor {
     match kernel {
         KernelType::Naive => matmul_naive(a, b),
         KernelType::Tiled => matmul_tiled(a, b, 16),
         KernelType::TiledPacked => matmul_tiled_packed(a, b, 16),
         KernelType::TiledMP => matmul_tiled_mp(a, b, 16),
     }
+}
+
+#[deprecated(
+    note = "selector::matmul does not build an autograd graph; use matmul_no_grad explicitly"
+)]
+pub fn matmul(a: &Tensor, b: &Tensor, kernel: KernelType) -> Tensor {
+    matmul_no_grad(a, b, kernel)
 }
 
 pub fn matmul_into(a: &Tensor, b: &Tensor, kernel: KernelType, out: &mut [f32]) {
@@ -277,5 +285,124 @@ pub fn matmul_add_into_slices_a_transposed(
             matmul_tiled_add_into_slices_a_transposed(a, m, n, b, p, out, 16)
         }
         KernelType::TiledMP => matmul_tiled_mp_add_into_slices_a_transposed(a, m, n, b, p, out, 16),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KernelType, matmul_into};
+    use super::{matmul_add_into_slices_a_transposed, matmul_add_into_slices_b_transposed};
+    use crate::tensor::tensor::Tensor;
+
+    fn ref_mm(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32> {
+        // (m x k) @ (k x n) -> (m x n)
+        let mut out = vec![0.0; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0;
+                for t in 0..k {
+                    acc += a[i * k + t] * b[t * n + j];
+                }
+                out[i * n + j] = acc;
+            }
+        }
+        out
+    }
+
+    fn ref_mm_b_t(a: &[f32], m: usize, k: usize, b_t: &[f32], n: usize) -> Vec<f32> {
+        // (m x k) @ (n x k)^T -> (m x n)
+        let mut out = vec![0.0; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0;
+                for t in 0..k {
+                    acc += a[i * k + t] * b_t[j * k + t];
+                }
+                out[i * n + j] = acc;
+            }
+        }
+        out
+    }
+
+    fn ref_mm_a_t(a: &[f32], m: usize, n: usize, b: &[f32], p: usize) -> Vec<f32> {
+        // (m x n)^T @ (m x p) -> (n x p)
+        let mut out = vec![0.0; n * p];
+        for i in 0..n {
+            for j in 0..p {
+                let mut acc = 0.0;
+                for t in 0..m {
+                    acc += a[t * n + i] * b[t * p + j];
+                }
+                out[i * p + j] = acc;
+            }
+        }
+        out
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        let mut maxd = 0.0f32;
+        for i in 0..a.len() {
+            let d = (a[i] - b[i]).abs();
+            if d > maxd {
+                maxd = d;
+            }
+        }
+        maxd
+    }
+
+    #[test]
+    fn kernels_support_nn_nt_tn_and_match_reference() {
+        let m = 3usize;
+        let k = 5usize;
+        let n = 4usize;
+        let p = 6usize;
+
+        // Deterministic small matrices (avoid RNG dependency).
+        let a: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.1 - 0.7).collect();
+        let b: Vec<f32> = (0..(k * n)).map(|i| (i as f32) * -0.07 + 0.3).collect();
+        let b_t: Vec<f32> = (0..(n * k)).map(|i| (i as f32) * 0.05 - 0.2).collect();
+        let b2: Vec<f32> = (0..(m * p)).map(|i| (i as f32) * 0.03 + 0.1).collect();
+
+        let a_ten = Tensor::new(a.clone(), vec![m, k], false);
+        let b_ten = Tensor::new(b.clone(), vec![k, n], false);
+
+        let ref_nn = ref_mm(&a, m, k, &b, n);
+        let ref_nt = ref_mm_b_t(&a, m, k, &b_t, n);
+        let ref_tn = ref_mm_a_t(&a, m, k, &b2, p);
+
+        for kernel in [
+            KernelType::Naive,
+            KernelType::Tiled,
+            KernelType::TiledPacked,
+            KernelType::TiledMP,
+        ] {
+            // NN
+            let mut out = vec![0.0; m * n];
+            matmul_into(&a_ten, &b_ten, kernel, &mut out);
+            assert!(
+                max_abs_diff(&out, &ref_nn) < 1e-4,
+                "NN mismatch for {:?}",
+                kernel
+            );
+
+            // NT: out += A @ B^T
+            let mut out_nt = vec![0.0; m * n];
+            matmul_add_into_slices_b_transposed(kernel, &a, m, k, &b_t, n, &mut out_nt);
+            assert!(
+                max_abs_diff(&out_nt, &ref_nt) < 1e-4,
+                "NT mismatch for {:?}",
+                kernel
+            );
+
+            // TN: out += A^T @ B
+            let mut out_tn = vec![0.0; k * p];
+            matmul_add_into_slices_a_transposed(kernel, &a, m, k, &b2, p, &mut out_tn);
+            assert!(
+                max_abs_diff(&out_tn, &ref_tn) < 1e-4,
+                "TN mismatch for {:?}",
+                kernel
+            );
+        }
     }
 }
