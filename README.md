@@ -52,7 +52,7 @@ gradients are reused instead of reallocated (and released early when the planner
 
 
 <p align="center">
-	<img src="bin/poolgrad.svg" width="520" alt="poolgrad overview" />
+	<img src="bin/poolgrad.png" width="700" alt="poolgrad overview" />
 </p>
 
 ---
