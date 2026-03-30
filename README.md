@@ -52,6 +52,11 @@ The packed path is used for sufficiently large problems to amortize packing over
 - `POOLGRAD_PAR=1|0` (default `1`)
 - `POOLGRAD_PAR_MIN_ELEMS=<usize>` (default `16384`)
 
+### MP kernel gating
+
+- `POOLGRAD_MP_MAX_SIZE=<usize>` (default `128`)
+  - If `max(m, n, p)` exceeds this, MP/Strassen-style transforms are skipped (the MP kernel falls back to tiled style, and the scheduler will not select MP).
+
 ### Bench harness
 
 - `POOLGRAD_BENCH_WARMUP=<usize>` (default `2`)
@@ -63,7 +68,16 @@ The packed path is used for sufficiently large problems to amortize packing over
 - `POOLGRAD_SCHED_TILED_MAX=<usize>`
 - `POOLGRAD_SCHED_PACKED_MAX=<usize>`
 
+Additional (shape-aware) heuristics:
+
+- `POOLGRAD_SCHED_TINY_WORK_MAX=<usize>` (default `262144`)
+- `POOLGRAD_SCHED_INNER_SMALL_MAX=<usize>` (default `32`)
+
 The defaults are tuned to prefer `Naive` only for small sizes and move to `TiledPacked` for larger sizes.
+
+### Logging
+
+- `POOLGRAD_VERBOSE=1` prints per-epoch loss/output (and lifetime debug on the final epoch).
 
 ### Forcing kernel / microkernel
 

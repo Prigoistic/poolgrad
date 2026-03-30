@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-
+use crate::config::{mp_max_size, par_min_elems, parallel_enabled};
 use crate::kernels::mp::{MPScratch, MPTransform, mp_block_mul_add};
 use crate::kernels::tiled::matmul_tiled_into_slices;
 use crate::kernels::tiled::{
@@ -7,21 +6,7 @@ use crate::kernels::tiled::{
 };
 use crate::tensor::tensor::Tensor;
 use rayon::prelude::*;
-
-fn parallel_enabled() -> bool {
-    std::env::var("POOLGRAD_PAR")
-        .ok()
-        .as_deref()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
-}
-
-fn par_min_elems() -> usize {
-    std::env::var("POOLGRAD_PAR_MIN_ELEMS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16 * 1024)
-}
+use std::sync::OnceLock;
 
 #[allow(clippy::too_many_arguments)]
 fn tiled_style_block_mul_accum(
@@ -65,21 +50,17 @@ pub fn matmul_tiled_mp_into_slices(
     assert_eq!(a.len(), m * n);
     assert_eq!(b.len(), n * p);
     assert_eq!(out.len(), m * p);
+    assert!(block > 0, "matmul_tiled_mp_into_slices: block must be > 0");
 
     let size_hint = m.max(n).max(p);
-    let mp_max_size = std::env::var("POOLGRAD_MP_MAX_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(128);
-    let mp_enabled = size_hint <= mp_max_size;
-
-    if !mp_enabled {
+    if size_hint > mp_max_size() {
         // Exact fallback: reuse the existing tiled kernel, which matches naive accumulation order.
         matmul_tiled_into_slices(a, m, n, b, p, out, block);
         return;
     }
 
-    let transform = MPTransform::strassen();
+    static TRANSFORM: OnceLock<MPTransform> = OnceLock::new();
+    let transform = TRANSFORM.get_or_init(MPTransform::strassen);
 
     if parallel_enabled() && m * p >= par_min_elems() && block > 0 {
         let rows_per_chunk = block.min(m).max(1);
@@ -101,7 +82,7 @@ pub fn matmul_tiled_mp_into_slices(
                         let bp = (jj + block).min(p) - jj;
                         let bn = (kk + block).min(n) - kk;
 
-                        if mp_enabled && bm == block && bp == block && bn == block {
+                        if bm == block && bp == block && bn == block {
                             let applied = mp_block_mul_add(
                                 a,
                                 n,
@@ -116,7 +97,7 @@ pub fn matmul_tiled_mp_into_slices(
                                 0,
                                 jj,
                                 block,
-                                &transform,
+                                transform,
                                 &mut scratch,
                             );
                             if applied {
@@ -139,7 +120,7 @@ pub fn matmul_tiled_mp_into_slices(
                     let bp = (jj + block).min(p) - jj;
                     let bn = (kk + block).min(n) - kk;
 
-                    if mp_enabled && bm == block && bp == block && bn == block {
+                    if bm == block && bp == block && bn == block {
                         let applied = mp_block_mul_add(
                             a,
                             n,
@@ -154,7 +135,7 @@ pub fn matmul_tiled_mp_into_slices(
                             ii,
                             jj,
                             block,
-                            &transform,
+                            transform,
                             &mut scratch,
                         );
                         if applied {

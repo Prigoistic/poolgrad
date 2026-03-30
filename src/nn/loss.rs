@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::autograd::graph::Graph;
 use crate::autograd::node::{Node, Operation};
 use crate::mem::pool::MemoryPool;
@@ -45,8 +43,7 @@ pub fn mse(
         op: Operation::MSE,
     };
 
-    let node_id = graph.nodes.len();
-    graph.add_node(node);
+    let node_id = graph.add_node(node);
     store.get_mut(loss_id).creator = Some(node_id);
 
     loss_id

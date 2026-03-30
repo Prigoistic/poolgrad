@@ -1,23 +1,9 @@
+use crate::config::{par_min_elems, parallel_enabled};
 use crate::tensor::tensor::Tensor;
 use rayon::prelude::*;
 use std::sync::OnceLock;
 
 const MR: usize = 4;
-
-fn parallel_enabled() -> bool {
-    std::env::var("POOLGRAD_PAR")
-        .ok()
-        .as_deref()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
-}
-
-fn par_min_elems() -> usize {
-    std::env::var("POOLGRAD_PAR_MIN_ELEMS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16 * 1024)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MicroKernel {
@@ -292,7 +278,7 @@ fn matmul_tiled_nn_packed_add_into(
     // panel across all row chunks, avoiding repacking `b` per slab.
     // Packed kernels tend to have higher per-task overhead (packing, microkernel setup),
     // so use a higher threshold before turning on Rayon.
-    let use_par = parallel_enabled() && m * p >= par_min_elems().saturating_mul(4);
+    let use_par = parallel_enabled() && m * p >= par_min_elems().saturating_mul(8);
     // Use coarser chunks than `block` to keep Rayon overhead amortized.
     let rows_per_chunk = block.saturating_mul(4).max(MR).min(m).max(1);
     let chunk_elems = rows_per_chunk * p;
@@ -497,7 +483,7 @@ fn matmul_tiled_nt_packed_add_into(
 
     // Packed kernels tend to have higher per-task overhead (packing, microkernel setup),
     // so use a higher threshold before turning on Rayon.
-    let use_par = parallel_enabled() && m * n >= par_min_elems().saturating_mul(4);
+    let use_par = parallel_enabled() && m * n >= par_min_elems().saturating_mul(8);
     // Use coarser chunks than `block` to keep Rayon overhead amortized.
     let rows_per_chunk = block.saturating_mul(4).max(MR).min(m).max(1);
     let chunk_elems = rows_per_chunk * n;
@@ -703,7 +689,7 @@ fn matmul_tiled_tn_packed_add_into(
 
     // Packed kernels tend to have higher per-task overhead (packing, microkernel setup),
     // so use a higher threshold before turning on Rayon.
-    let use_par = parallel_enabled() && n * p >= par_min_elems().saturating_mul(4);
+    let use_par = parallel_enabled() && n * p >= par_min_elems().saturating_mul(8);
     // Use coarser chunks than `block` to keep Rayon overhead amortized.
     let rows_per_chunk = block.saturating_mul(4).max(MR).min(n).max(1);
     let chunk_elems = rows_per_chunk * p;

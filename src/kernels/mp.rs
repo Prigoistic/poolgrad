@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 /// MP-inspired block-level bilinear transform.
 ///
 /// This is implemented as a single algebraic transform over 2×2 sub-blocks (Strassen form),

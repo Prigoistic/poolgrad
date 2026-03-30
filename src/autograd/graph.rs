@@ -9,22 +9,27 @@ use crate::kernels::selector::{
 
 use std::collections::HashMap;
 
-#[allow(dead_code)]
+/// A minimal reverse-mode autograd tape.
+///
+/// Node ids are stable indices into `nodes`.
 pub struct Graph {
     pub nodes: Vec<Node>,
 }
 
-#[allow(dead_code)]
 impl Graph {
     pub fn new() -> Self {
         Self { nodes: Vec::new() }
     }
 
-    pub fn add_node(&mut self, node: Node) {
+    pub fn add_node(&mut self, node: Node) -> usize {
+        let node_id = self.nodes.len();
         self.nodes.push(node);
+        node_id
     }
 
-    pub fn backward(&self, store: &mut TensorStore, loss_id: usize, _pool: &mut MemoryPool) {
+    pub fn backward(&self, store: &mut TensorStore, loss_id: usize, pool: &mut MemoryPool) {
+        self.ensure_grad_buffers_for_graph(store, loss_id, pool);
+
         // Contract: `backward(loss_id)` seeds scalar loss with 1.0.
         // For non-scalar outputs, use `backward_seeded`.
         {
@@ -42,19 +47,15 @@ impl Graph {
         self.backward_internal(store, loss_id);
     }
 
-    /// Clears gradients for tensors referenced by this graph, then runs `backward`.
-    pub fn backward_zeroed(&self, store: &mut TensorStore, loss_id: usize, pool: &mut MemoryPool) {
-        self.zero_grads_for_graph(store, pool);
-        self.backward(store, loss_id, pool);
-    }
-
     pub fn backward_seeded(
         &self,
         store: &mut TensorStore,
         output_id: usize,
         seed: &[f32],
-        _pool: &mut MemoryPool,
+        pool: &mut MemoryPool,
     ) {
+        self.ensure_grad_buffers_for_graph(store, output_id, pool);
+
         {
             let out = store.get_mut(output_id);
             if out.requires_grad {
@@ -70,21 +71,17 @@ impl Graph {
         self.backward_internal(store, output_id);
     }
 
-    /// Clears gradients for tensors referenced by this graph, then runs `backward_seeded`.
-    pub fn backward_seeded_zeroed(
+    fn ensure_grad_buffers_for_graph(
         &self,
         store: &mut TensorStore,
         output_id: usize,
-        seed: &[f32],
         pool: &mut MemoryPool,
     ) {
-        self.zero_grads_for_graph(store, pool);
-        self.backward_seeded(store, output_id, seed, pool);
-    }
-
-    fn zero_grads_for_graph(&self, store: &mut TensorStore, pool: &mut MemoryPool) {
-        // Only touch tensors referenced by this graph (inputs + outputs).
         let mut touched = vec![false; store.tensors.len()];
+        if output_id < touched.len() {
+            touched[output_id] = true;
+        }
+
         for node in &self.nodes {
             if node.output < touched.len() {
                 touched[node.output] = true;
@@ -110,7 +107,6 @@ impl Graph {
                 continue;
             }
 
-            // If a grad buffer was released to the pool (planner), re-acquire it.
             if t.grad.is_empty() {
                 t.grad = pool.get(t.data.len());
             } else {
@@ -120,7 +116,6 @@ impl Graph {
                     "Tensor {}: grad len != data len",
                     id
                 );
-                t.grad.fill(0.0);
             }
         }
     }
@@ -165,7 +160,7 @@ impl Graph {
                             assert_eq!(
                                 a.grad.len(),
                                 a.data.len(),
-                                "Add backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                                "Add backward: missing/invalid grad buffer for tensor {}",
                                 a_id
                             );
                             debug_assert_eq!(
@@ -183,7 +178,7 @@ impl Graph {
                             assert_eq!(
                                 a.grad.len(),
                                 a.data.len(),
-                                "Add backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                                "Add backward: missing/invalid grad buffer for tensor {}",
                                 a_id
                             );
                         }
@@ -191,7 +186,7 @@ impl Graph {
                             assert_eq!(
                                 b.grad.len(),
                                 b.data.len(),
-                                "Add backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                                "Add backward: missing/invalid grad buffer for tensor {}",
                                 b_id
                             );
                         }
@@ -239,7 +234,7 @@ impl Graph {
                             assert_eq!(
                                 a.grad.len(),
                                 a.data.len(),
-                                "Mul backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                                "Mul backward: missing/invalid grad buffer for tensor {}",
                                 a_id
                             );
                             debug_assert_eq!(
@@ -257,7 +252,7 @@ impl Graph {
                             assert_eq!(
                                 a.grad.len(),
                                 a.data.len(),
-                                "Mul backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                                "Mul backward: missing/invalid grad buffer for tensor {}",
                                 a_id
                             );
                         }
@@ -265,7 +260,7 @@ impl Graph {
                             assert_eq!(
                                 b.grad.len(),
                                 b.data.len(),
-                                "Mul backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                                "Mul backward: missing/invalid grad buffer for tensor {}",
                                 b_id
                             );
                         }
@@ -314,7 +309,7 @@ impl Graph {
                         assert_eq!(
                             a.grad.len(),
                             a.data.len(),
-                            "MatMul backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                            "MatMul backward: missing/invalid grad buffer for tensor {}",
                             a_id
                         );
                         let (m, n) = (a.shape[0], a.shape[1]);
@@ -367,7 +362,7 @@ impl Graph {
                         assert_eq!(
                             a.grad.len(),
                             a.data.len(),
-                            "MatMul backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                            "MatMul backward: missing/invalid grad buffer for tensor {}",
                             a_id
                         );
                     }
@@ -375,7 +370,7 @@ impl Graph {
                         assert_eq!(
                             b.grad.len(),
                             b.data.len(),
-                            "MatMul backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                            "MatMul backward: missing/invalid grad buffer for tensor {}",
                             b_id
                         );
                     }
@@ -434,7 +429,7 @@ impl Graph {
                     assert_eq!(
                         input.grad.len(),
                         input.data.len(),
-                        "ReLU backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                        "ReLU backward: missing/invalid grad buffer for tensor {}",
                         input_id
                     );
                     debug_assert_eq!(
@@ -487,7 +482,7 @@ impl Graph {
                         assert_eq!(
                             pred.grad.len(),
                             pred.data.len(),
-                            "MSE backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                            "MSE backward: missing/invalid grad buffer for tensor {}",
                             pred_id
                         );
                     }
@@ -495,7 +490,7 @@ impl Graph {
                         assert_eq!(
                             target.grad.len(),
                             target.data.len(),
-                            "MSE backward: missing/invalid grad buffer for tensor {} (use backward_zeroed if grads were released)",
+                            "MSE backward: missing/invalid grad buffer for tensor {}",
                             target_id
                         );
                     }
@@ -523,7 +518,7 @@ mod tests {
     use super::Graph;
     use crate::mem::pool::MemoryPool;
     use crate::tensor::store::TensorStore;
-    use crate::tensor::tensor::{Tensor, matmul, mul, relu};
+    use crate::tensor::tensor::{Tensor, add, matmul, mul, relu};
 
     fn loss_sum(output: &[f32]) -> f32 {
         output.iter().copied().sum::<f32>()
@@ -608,7 +603,7 @@ mod tests {
 
         let a_id = store.add(Tensor::new(a0.clone(), vec![2, 3], true));
         let b_id = store.add(Tensor::new(b0.clone(), vec![2, 3], true));
-        let out_id = Tensor::add(a_id, b_id, &mut store, &mut graph);
+        let out_id = add(a_id, b_id, &mut store, &mut graph);
 
         let seed = vec![1.0; store.get(out_id).data.len()];
         graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
@@ -622,7 +617,7 @@ mod tests {
             let mut graph = Graph::new();
             let a_id = store.add(Tensor::new(a.to_vec(), vec![2, 3], true));
             let b_id = store.add(Tensor::new(b0.clone(), vec![2, 3], true));
-            let out_id = Tensor::add(a_id, b_id, &mut store, &mut graph);
+            let out_id = add(a_id, b_id, &mut store, &mut graph);
             loss_sum(&store.get(out_id).data)
         };
         let f_b = |b: &[f32]| {
@@ -630,7 +625,7 @@ mod tests {
             let mut graph = Graph::new();
             let a_id = store.add(Tensor::new(a0.clone(), vec![2, 3], true));
             let b_id = store.add(Tensor::new(b.to_vec(), vec![2, 3], true));
-            let out_id = Tensor::add(a_id, b_id, &mut store, &mut graph);
+            let out_id = add(a_id, b_id, &mut store, &mut graph);
             loss_sum(&store.get(out_id).data)
         };
 
@@ -842,7 +837,7 @@ mod tests {
 
         let x_id = store.add(Tensor::new(x0.clone(), vec![4], true));
         let y_id = mul(x_id, x_id, &mut store, &mut graph);
-        let z_id = Tensor::add(y_id, x_id, &mut store, &mut graph);
+        let z_id = add(y_id, x_id, &mut store, &mut graph);
         let seed = vec![1.0; store.get(z_id).data.len()];
         graph.backward_seeded(&mut store, z_id, &seed, &mut pool);
         let gx = store.get(x_id).grad.clone();
@@ -853,7 +848,7 @@ mod tests {
             let mut graph = Graph::new();
             let x_id = store.add(Tensor::new(x.to_vec(), vec![4], true));
             let y_id = mul(x_id, x_id, &mut store, &mut graph);
-            let z_id = Tensor::add(y_id, x_id, &mut store, &mut graph);
+            let z_id = add(y_id, x_id, &mut store, &mut graph);
             loss_sum(&store.get(z_id).data)
         };
         let ngx = finite_diff_grad(x0, eps, f_x);

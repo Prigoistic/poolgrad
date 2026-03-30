@@ -46,30 +46,6 @@ impl TensorStore {
         &mut self.tensors[id]
     }
 
-    #[allow(dead_code)]
-    pub fn get2_mut(&mut self, id1: usize, id2: usize) -> (&mut Tensor, &mut Tensor) {
-        assert_ne!(
-            id1, id2,
-            "ids must be distinct; use get_mut for same-id case"
-        );
-
-        let (low, high, low_first) = if id1 < id2 {
-            (id1, id2, true)
-        } else {
-            (id2, id1, false)
-        };
-
-        let (left, right) = self.tensors.split_at_mut(high);
-        let high_ref = &mut right[0];
-        let low_ref = &mut left[low];
-
-        if low_first {
-            (low_ref, high_ref)
-        } else {
-            (high_ref, low_ref)
-        }
-    }
-
     pub fn get_mut_and_1(&mut self, id_mut: usize, id_immut: usize) -> (&mut Tensor, &Tensor) {
         assert_ne!(id_mut, id_immut, "ids must be distinct");
 
@@ -124,5 +100,3 @@ impl TensorStore {
         }
     }
 }
-
-// Rust ownership rules will destroy you otherwise.

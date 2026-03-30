@@ -43,11 +43,6 @@ impl MemoryPool {
         GLOBAL_PEAK_MEMORY.store(0, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
-    pub fn global_current_memory_bytes() -> usize {
-        GLOBAL_CURRENT_MEMORY.load(Ordering::Relaxed)
-    }
-
     pub fn global_peak_memory_bytes() -> usize {
         GLOBAL_PEAK_MEMORY.load(Ordering::Relaxed)
     }
@@ -75,11 +70,6 @@ impl MemoryPool {
             .checked_add(self.cached_memory)
             .expect("MemoryPool: resident bytes overflow");
         self.resident_peak = self.resident_peak.max(resident);
-    }
-
-    #[allow(dead_code)]
-    pub fn resident_current_bytes(&self) -> usize {
-        self.current_memory + self.cached_memory
     }
 
     pub fn get(&mut self, size: usize) -> Vec<f32> {
@@ -119,51 +109,6 @@ impl MemoryPool {
             .current_memory
             .checked_add(bytes)
             .expect("MemoryPool::get: current_memory overflow");
-
-        let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        update_global_peak(global_after);
-        self.update_peaks();
-
-        vec![0.0; size]
-    }
-
-    #[allow(dead_code)]
-    pub fn get_no_clear(&mut self, size: usize) -> Vec<f32> {
-        // Identical accounting to `get`, but does not clear reused buffers.
-        // Only use when the caller overwrites every element before reading.
-        let bytes = size
-            .checked_mul(4)
-            .expect("MemoryPool::get_no_clear: size overflow when computing bytes");
-
-        if self.enabled
-            && let Some(buffers) = self.free.get_mut(&size)
-            && let Some(buffer) = buffers.pop()
-        {
-            self.reuses += 1;
-
-            self.cached_memory = self
-                .cached_memory
-                .checked_sub(bytes)
-                .expect("MemoryPool::get_no_clear: cached_memory underflow");
-
-            self.current_memory = self
-                .current_memory
-                .checked_add(bytes)
-                .expect("MemoryPool::get_no_clear: current_memory overflow");
-
-            let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
-            update_global_peak(global_after);
-            self.update_peaks();
-
-            return buffer;
-        }
-
-        // Fresh allocation.
-        self.allocations += 1;
-        self.current_memory = self
-            .current_memory
-            .checked_add(bytes)
-            .expect("MemoryPool::get_no_clear: current_memory overflow");
 
         let global_after = GLOBAL_CURRENT_MEMORY.fetch_add(bytes, Ordering::Relaxed) + bytes;
         update_global_peak(global_after);

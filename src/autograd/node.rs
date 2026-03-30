@@ -1,5 +1,4 @@
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct Node {
     pub input0: usize,
     pub input1: Option<usize>,
@@ -8,12 +7,13 @@ pub struct Node {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum Operation {
     Add,
+    #[allow(dead_code)]
     Mul,
     MatMul,
+    #[allow(dead_code)]
     ReLU,
     MSE,
 }

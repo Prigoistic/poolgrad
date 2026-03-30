@@ -1,8 +1,9 @@
 mod autograd;
+mod config;
 mod kernels;
 mod mem;
 mod nn;
-mod plannar;
+mod planner;
 mod tensor;
 
 use std::time::Instant;
@@ -15,7 +16,7 @@ use kernels::tiled::{matmul_tiled, matmul_tiled_packed};
 use mem::pool::MemoryPool;
 use nn::linear::Linear;
 use nn::loss::mse;
-use plannar::lifetime::compute_lifetimes;
+use planner::lifetime::compute_lifetimes;
 use tensor::store::TensorStore;
 use tensor::tensor::Tensor;
 
@@ -435,7 +436,7 @@ fn run_kernel_benchmark() {
 }
 
 fn run_forward_backward_step_benchmark() {
-    use tensor::tensor::matmul_scheduled_with_pool;
+    use tensor::tensor::matmul_with_pool;
 
     // Measures a training-style step: forward matmul + backward gradients.
     let sizes = [64usize, 128, 256];
@@ -467,7 +468,7 @@ fn run_forward_backward_step_benchmark() {
             let mut graph = Graph::new();
             let a_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
             let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
-            let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
+            let out_id = matmul_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
             let seed = vec![1.0; store.get(out_id).grad.len()];
             graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
             release_intermediate_grads(&mut store, &graph, &mut pool, false);
@@ -487,7 +488,7 @@ fn run_forward_backward_step_benchmark() {
             let a_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
             let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
 
-            let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
+            let out_id = matmul_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
             let seed = vec![1.0; store.get(out_id).grad.len()];
             graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
             release_intermediate_grads(&mut store, &graph, &mut pool, false);
@@ -550,7 +551,7 @@ fn main() {
 
 fn run_kernel_pool_interaction_experiment() -> usize {
     use kernels::selector::KernelType;
-    use tensor::tensor::matmul_scheduled_with_pool;
+    use tensor::tensor::matmul_with_pool;
 
     let sizes = [16usize, 32, 64, 128, 256];
     let mut pool = MemoryPool::new();
@@ -579,7 +580,7 @@ fn run_kernel_pool_interaction_experiment() -> usize {
             let a_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
             let b_id = store.add(Tensor::new(vec![1.0; size * size], vec![size, size], true));
 
-            let out_id = matmul_scheduled_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
+            let out_id = matmul_with_pool(a_id, b_id, &mut store, &mut graph, &mut pool);
             let seed = vec![1.0; store.get(out_id).grad.len()];
             graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
             release_intermediate_grads(&mut store, &graph, &mut pool, false);
@@ -598,4 +599,106 @@ fn run_kernel_pool_interaction_experiment() -> usize {
     }
 
     exp_peak
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_intermediate_grads;
+    use crate::autograd::graph::Graph;
+    use crate::mem::pool::MemoryPool;
+    use crate::nn::linear::Linear;
+    use crate::nn::loss::mse;
+    use crate::tensor::store::TensorStore;
+    use crate::tensor::tensor::Tensor;
+
+    #[test]
+    fn pool_lifecycle_is_bounded_across_epochs() {
+        let mut store = TensorStore::new();
+        let mut graph = Graph::new();
+        let mut pool = MemoryPool::new();
+        pool.enabled = true;
+
+        let mut x_id = store.add(Tensor::new(vec![1.0, 2.0], vec![1, 2], true));
+        let mut target_id = store.add(Tensor::new(vec![3.0, 3.0, 3.0], vec![1, 3], false));
+
+        let mut linear = Linear::new(2, 3, &mut store);
+
+        let mut cached_end: Vec<usize> = Vec::new();
+
+        for _epoch in 0..6 {
+            // The store should contain only the persistent tensors at the start of each epoch.
+            assert_eq!(
+                store.tensors.len(),
+                4,
+                "expected TensorStore to stay epoch-bounded"
+            );
+
+            // forward
+            let out_id = linear.forward(x_id, &mut store, &mut graph, &mut pool);
+            let loss_id = mse(out_id, target_id, &mut store, &mut graph, &mut pool);
+
+            // backward
+            graph.backward(&mut store, loss_id, &mut pool);
+
+            // update weights
+            let lr = 0.01;
+
+            let weight = store.get_mut(linear.weight_id);
+            for i in 0..weight.data.len() {
+                weight.data[i] -= lr * weight.grad[i];
+            }
+
+            let bias = store.get_mut(linear.bias_id);
+            for i in 0..bias.data.len() {
+                bias.data[i] -= lr * bias.grad[i];
+            }
+
+            release_intermediate_grads(&mut store, &graph, &mut pool, false);
+
+            assert_eq!(
+                pool.current_memory, 0,
+                "pool.current_memory should return to 0 after releasing intermediate grads"
+            );
+
+            cached_end.push(pool.cached_memory);
+
+            // Rebuild store+graph each epoch to mimic the training loop invariant.
+            let mut old = std::mem::take(&mut store.tensors);
+
+            let mut bias = old.swap_remove(linear.bias_id);
+            let mut weight = old.swap_remove(linear.weight_id);
+            let mut target = old.swap_remove(target_id);
+            let mut x = old.swap_remove(x_id);
+
+            x.creator = None;
+            target.creator = None;
+            weight.creator = None;
+            bias.creator = None;
+
+            x.zero_grad();
+            weight.zero_grad();
+            bias.zero_grad();
+
+            drop(old);
+
+            store = TensorStore::new();
+            graph = Graph::new();
+
+            x_id = store.add(x);
+            target_id = store.add(target);
+            linear.weight_id = store.add(weight);
+            linear.bias_id = store.add(bias);
+        }
+
+        // Fixed-shape workload: once the pool has enough cached buffers after the first epoch,
+        // it should not need to grow further.
+        let expected = cached_end[0];
+        for (epoch, &cached) in cached_end.iter().enumerate().skip(1) {
+            assert_eq!(
+                cached, expected,
+                "pool.cached_memory grew at epoch {} ({} -> {})",
+                epoch, expected, cached
+            );
+        }
+    }
 }

@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-
+use crate::config::{mp_max_size, parallel_enabled};
 use crate::kernels::naive::matmul_naive;
 use crate::kernels::naive::matmul_naive_add_into_slices_a_transposed;
 use crate::kernels::naive::matmul_naive_add_into_slices_b_transposed;
@@ -26,15 +25,8 @@ pub enum KernelType {
     TiledMP,
 }
 
-fn parallel_enabled() -> bool {
-    static PAR_ENABLED: OnceLock<bool> = OnceLock::new();
-    *PAR_ENABLED.get_or_init(|| {
-        std::env::var("POOLGRAD_PAR")
-            .ok()
-            .as_deref()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true)
-    })
+fn mp_enabled_for(size_hint: usize) -> bool {
+    size_hint <= mp_max_size()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +34,8 @@ struct SchedulerConfig {
     naive_max: usize,
     tiled_max: usize,
     packed_max: usize,
+    tiny_work_max: usize,
+    inner_small_max: usize,
 }
 
 fn scheduler_config() -> &'static SchedulerConfig {
@@ -80,10 +74,22 @@ fn scheduler_config() -> &'static SchedulerConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(default_packed_max);
 
+        let tiny_work_max = std::env::var("POOLGRAD_SCHED_TINY_WORK_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64 * 64 * 64);
+
+        let inner_small_max = std::env::var("POOLGRAD_SCHED_INNER_SMALL_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
+
         SchedulerConfig {
             naive_max,
             tiled_max,
             packed_max,
+            tiny_work_max,
+            inner_small_max,
         }
     })
 }
@@ -144,36 +150,9 @@ fn load_kernel_profile_once() -> &'static Option<HashMap<usize, KernelType>> {
     })
 }
 
-// Encodes measured/assumed performance knowledge into system behavior.
-// `size` is the characteristic problem size (e.g. square matrix dimension).
-pub fn select_kernel(size: usize) -> KernelType {
-    if let Some(k) = forced_kernel() {
-        return k;
-    }
-
-    if let Some(profile) = load_kernel_profile_once().as_ref()
-        && let Some(&k) = profile.get(&size)
-    {
-        return k;
-    }
-
-    let cfg = scheduler_config();
-
-    if size <= cfg.naive_max {
-        KernelType::Naive
-    } else if size <= cfg.tiled_max {
-        KernelType::Tiled
-    } else if size <= cfg.packed_max {
-        KernelType::TiledPacked
-    } else {
-        KernelType::TiledMP
-    }
-}
-
 /// Shape-aware kernel selection.
 ///
 /// This is intended for real workloads where matrices are not necessarily square.
-/// Benchmarks/profiles may continue using `select_kernel(size)`.
 pub fn select_kernel_mm(m: usize, n: usize, p: usize) -> KernelType {
     let size_hint = m.max(n).max(p);
 
@@ -199,21 +178,13 @@ pub fn select_kernel_mm(m: usize, n: usize, p: usize) -> KernelType {
     }
 
     // Avoid packing for small total work.
-    let tiny_work_max = std::env::var("POOLGRAD_SCHED_TINY_WORK_MAX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(64 * 64 * 64);
-    if work < tiny_work_max {
+    if work < cfg.tiny_work_max {
         return KernelType::Tiled;
     }
 
     // If the reduction dimension is small, the scalar tiled kernel tends to do fine.
     // This also avoids packing when `n` is skinny.
-    let inner_small_max = std::env::var("POOLGRAD_SCHED_INNER_SMALL_MAX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(32);
-    if n <= inner_small_max {
+    if n <= cfg.inner_small_max {
         return KernelType::Tiled;
     }
 
@@ -221,8 +192,11 @@ pub fn select_kernel_mm(m: usize, n: usize, p: usize) -> KernelType {
         KernelType::Tiled
     } else if size_hint <= cfg.packed_max {
         KernelType::TiledPacked
-    } else {
+    } else if mp_enabled_for(size_hint) {
         KernelType::TiledMP
+    } else {
+        // MP transforms are gated off for this size; keep using the packed kernel.
+        KernelType::TiledPacked
     }
 }
 
@@ -234,13 +208,6 @@ pub fn matmul_no_grad(a: &Tensor, b: &Tensor, kernel: KernelType) -> Tensor {
         KernelType::TiledPacked => matmul_tiled_packed(a, b, 16),
         KernelType::TiledMP => matmul_tiled_mp(a, b, 16),
     }
-}
-
-#[deprecated(
-    note = "selector::matmul does not build an autograd graph; use matmul_no_grad explicitly"
-)]
-pub fn matmul(a: &Tensor, b: &Tensor, kernel: KernelType) -> Tensor {
-    matmul_no_grad(a, b, kernel)
 }
 
 pub fn matmul_into(a: &Tensor, b: &Tensor, kernel: KernelType, out: &mut [f32]) {
@@ -292,6 +259,7 @@ pub fn matmul_add_into_slices_a_transposed(
 mod tests {
     use super::{KernelType, matmul_into};
     use super::{matmul_add_into_slices_a_transposed, matmul_add_into_slices_b_transposed};
+    use super::{mp_max_size, scheduler_config, select_kernel_mm};
     use crate::tensor::tensor::Tensor;
 
     fn ref_mm(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32> {
@@ -404,5 +372,19 @@ mod tests {
                 kernel
             );
         }
+    }
+
+    #[test]
+    fn scheduler_does_not_select_mp_when_gated_off() {
+        let cfg = scheduler_config();
+        let mp_max = mp_max_size();
+
+        // Pick a size that would otherwise trigger the "MP" branch, but is guaranteed to be
+        // outside the MP-enabled range.
+        let size = cfg
+            .packed_max
+            .saturating_add(1)
+            .max(mp_max.saturating_add(1));
+        assert_eq!(select_kernel_mm(size, size, size), KernelType::TiledPacked);
     }
 }

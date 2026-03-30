@@ -1,21 +1,17 @@
-#![allow(dead_code)]
-
-//y=mx+c this is the linear layer defination by changing the weights and bias we can change the line and fit it to the data
+/// A fully-connected linear layer: `y = x @ W + b`.
 use crate::autograd::graph::Graph;
 use crate::mem::pool::MemoryPool;
 use crate::tensor::store::TensorStore;
-use crate::tensor::tensor::{Tensor, matmul_scheduled_with_pool};
+use crate::tensor::tensor::{Tensor, add_with_pool, matmul_with_pool};
 
 pub struct Linear {
     pub weight_id: usize,
     pub bias_id: usize,
-    pub in_features: usize,
-    pub out_features: usize,
 }
 
 impl Linear {
     pub fn new(in_features: usize, out_features: usize, store: &mut TensorStore) -> Self {
-        // simple initialization (no fancy init yet) we will add Xavier or Kaiming later
+        // Simple constant init. (Initialization strategy is intentionally out of scope here.)
         let weight_data = vec![0.5; in_features * out_features];
         let bias_data = vec![0.0; out_features];
 
@@ -25,12 +21,7 @@ impl Linear {
         let weight_id = store.add(weight);
         let bias_id = store.add(bias);
 
-        Self {
-            weight_id,
-            bias_id,
-            in_features,
-            out_features,
-        }
+        Self { weight_id, bias_id }
     }
 }
 
@@ -42,9 +33,7 @@ impl Linear {
         graph: &mut Graph,
         pool: &mut MemoryPool,
     ) -> usize {
-        // ADDING x @ w
-        let matmul_out = matmul_scheduled_with_pool(input_id, self.weight_id, store, graph, pool);
-
-        Tensor::add_with_pool(matmul_out, self.bias_id, store, graph, pool)
+        let matmul_out = matmul_with_pool(input_id, self.weight_id, store, graph, pool);
+        add_with_pool(matmul_out, self.bias_id, store, graph, pool)
     }
 }
