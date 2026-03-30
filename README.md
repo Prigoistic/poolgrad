@@ -1,90 +1,129 @@
-# PoolGrad
+# poolgrad
 
-PoolGrad is a memory-aware ML runtime in Rust designed to study compute–memory tradeoffs in CPU matmul kernels and reverse-mode autograd.
+a tiny ML runtime in rust (with a bit of systems bite).
 
-## 2. What It Is
+it builds a minimal autograd engine, a few matrix multiplication kernels, and a small memory system — just enough to explore where performance actually comes from.
 
-Single-binary research playground with:
+this is not a framework. it’s a playground.
 
-- `Tensor` + `TensorStore` and a minimal reverse-mode tape (`Graph`)
-- a shape-aware matmul kernel selector
-- a size-classed gradient `MemoryPool`
-- a lifetime planner that releases intermediate grads early
+## what is this?
 
-## 3. System Overview
+poolgrad is a single-binary runtime that implements:
 
-Ops append nodes to a `Graph`; backward walks the tape in reverse and dispatches matmul gradients through the same kernel selector. Intermediate gradient buffers are returned to the pool when their last use passes.
+* reverse-mode autograd over a dynamic graph
+* multiple matmul kernels (naive, tiled, packed+simd, and an experimental mp variant)
+* a simple kernel scheduler
+* a gradient memory pool + lifetime-based release
+
+core autograd, kernels, pooling, and scheduling are handwritten; rayon is used for parallel loops.
+
+code map:
+
+* autograd: [src/autograd/graph.rs](src/autograd/graph.rs)
+* kernels + scheduler: [src/kernels/selector.rs](src/kernels/selector.rs)
+* packed microkernel + tiling: [src/kernels/tiled.rs](src/kernels/tiled.rs)
+* mp transform: [src/kernels/mp.rs](src/kernels/mp.rs)
+* memory pool: [src/mem/pool.rs](src/mem/pool.rs)
+* lifetime planner: [src/planner/lifetime.rs](src/planner/lifetime.rs)
+
+## why?
+
+most ML systems hide everything behind large abstractions.
+
+this project asks:
+
+> what actually makes neural networks fast?
+
+* fewer multiplications?
+* better memory access?
+* vector instructions?
+* less allocation?
+
+## a quick look
+
+forward builds a graph. backward walks it.
+
+kernels are shared between forward and backward.
+
+gradients are reused instead of reallocated (and released early when the planner says they’re dead).
 
 ```latex
 \begin{tikzpicture}
-\node (tensor) {Tensor + Store};
-\node (graph) [right=of tensor] {Graph (tape)};
-\node (sched) [right=of graph] {Kernel Selector};
-\node (kernel) [right=of sched] {MatMul Kernels};
-\node (mem) [below=of kernel] {MemoryPool};
-\node (plan) [below=of graph] {Lifetime Planner};
+\node (t) {tensor};
+\node (g) [right=of t] {graph};
+\node (k) [right=of g] {kernels};
+\node (m) [below=of k] {memory pool};
 
-\draw[->] (tensor) -- (graph);
-\draw[->] (graph) -- (sched);
-\draw[->] (sched) -- (kernel);
-\draw[->] (kernel) -- (mem);
-\draw[->] (graph) -- (plan);
-\draw[->] (plan) -- (mem);
+\draw[->] (t) -- (g);
+\draw[->] (g) -- (k);
+\draw[->] (k) -- (m);
 \end{tikzpicture}
 ```
 
-## 4. Key Components
+## the interesting part
 
-- Autograd: reverse-mode tape over `Operation::{Add, Mul, MatMul, ReLU, MSE}` ([src/autograd/graph.rs](src/autograd/graph.rs)).
-- Kernels: `KernelType::{Naive, Tiled, TiledPacked, TiledMP}` with optional Rayon parallelism ([src/kernels](src/kernels)).
-- Memory Pool: size-keyed free lists of `Vec<f32>` with alloc/reuse + peak tracking ([src/mem/pool.rs](src/mem/pool.rs)).
-- Scheduler: shape-aware selection with env overrides (`POOLGRAD_FORCE_KERNEL`, `POOLGRAD_SCHED_*`) ([src/kernels/selector.rs](src/kernels/selector.rs)).
+there are four ways to multiply matrices here:
 
-## 5. Experiments
+* naive loops
+* tiled (better cache use)
+* packed + simd (pack panels + microkernel; uses NEON on arm64 when available, AVX2+FMA on x86_64)
+* mp (single-level strassen-form block transform): fewer multiplies, more adds, more data movement
 
-Bench environment:
+the mp idea is simple:
 
-- Apple M4 (arm64, 10 cores), macOS; rustc 1.93.1
-- `cargo run --release`
-- `POOLGRAD_BENCH_WARMUP=2`, `POOLGRAD_BENCH_TRIALS=9`, `POOLGRAD_MP_MAX_SIZE=512`
+> can we compute the same result with fewer multiplications?
 
-Kernel performance (square GEMM, median over trials; speedup vs Naive):
+it’s strassen-like in spirit, but not recursive: it’s applied at block granularity.
 
-| Size | Kernel | Time (ms, median) | Speedup vs Naive |
-|---:|---|---:|---:|
-| 32 | Naive | 0.028 | 1.00 |
-| 32 | Tiled | 0.026 | 1.08 |
-| 32 | Packed+SIMD | 0.026 | 1.08 |
-| 32 | MP | 0.034 | 0.82 |
-| 64 | Naive | 0.208 | 1.00 |
-| 64 | Tiled | 0.206 | 1.01 |
-| 64 | Packed+SIMD | 0.023 | 9.04 |
-| 64 | MP | 0.236 | 0.88 |
-| 128 | Naive | 0.310 | 1.00 |
-| 128 | Tiled | 0.298 | 1.04 |
-| 128 | Packed+SIMD | 0.156 | 1.99 |
-| 128 | MP | 0.363 | 0.85 |
-| 256 | Naive | 2.115 | 1.00 |
-| 256 | Tiled | 1.443 | 1.47 |
-| 256 | Packed+SIMD | 0.902 | 2.34 |
-| 256 | MP | 1.774 | 1.19 |
-| 512 | Naive | 15.198 | 1.00 |
-| 512 | Tiled | 9.163 | 1.66 |
-| 512 | Packed+SIMD | 5.649 | 2.69 |
-| 512 | MP | 12.657 | 1.20 |
+## what happens
 
-Memory pooling (training loop, pool OFF vs ON):
+numbers below (kernel benchmark): apple m4 (arm64, 10 cores), rustc 1.93.1, `cargo run --release`, seed=0xbadc0de, `POOLGRAD_MP_MAX_SIZE=512`, warmup=2, trials=9, median reported.
 
-| Mode | Alloc | Reuse | Peak (bytes) |
+observations from these runs:
+
+* packed + simd dominates once sizes grow (e.g. 2.69x vs naive at 512)
+* tiling helps, but only moderately
+* mp reduces multiplies but is usually slower than packed (and can be slower than naive at mid sizes)
+* no single kernel wins everywhere → scheduling matters (at 32 the scheduler picked naive, but packed tied for best)
+
+kernel times (ms, median; square gemm):
+
+| n | naive | tiled | packed+simd | mp |
+|---:|---:|---:|---:|---:|
+| 32 | 0.028 | 0.026 | 0.026 | 0.034 |
+| 64 | 0.208 | 0.206 | 0.023 | 0.236 |
+| 128 | 0.310 | 0.298 | 0.156 | 0.363 |
+| 256 | 2.115 | 1.443 | 0.902 | 1.774 |
+| 512 | 15.198 | 9.163 | 5.649 | 12.657 |
+
+example (512 × 512):
+
+```text
+naive           15.2 ms
+tiled            9.2 ms
+packed+simd      5.6 ms
+mp              12.7 ms
+```
+
+## memory
+
+gradients are reused via a simple size-based pool.
+
+training loop (pool off vs on):
+
+| mode | allocations | reuses | peak resident bytes |
 |---|---:|---:|---:|
-| Baseline (pool OFF) | 30 | 0 | 28 |
-| Pooled (pool ON) | 3 | 27 | 28 |
+| pool off | 30 | 0 | 28 |
+| pool on | 3 | 27 | 28 |
 
-Allocation reduction vs baseline: 90.00%
+```text
+allocations: 30 -> 3
+reuse:        0 -> 27
+```
 
-Combined: kernel + pool interaction (forward matmul + seeded backward; scheduler-selected kernel; one pool reused across sizes):
+kernel + pool interaction (forward matmul + seeded backward; scheduler-selected kernel; one pool reused across sizes):
 
-| Size | Kernel | Iters | Time (ms) | Alloc | Reuse | LivePeak (bytes) | ResidentPeak (bytes) |
+| n | kernel | iters | time (ms) | alloc | reuse | live peak (bytes) | resident peak (bytes) |
 |---:|---|---:|---:|---:|---:|---:|---:|
 | 32 | Naive | 10 | 0.305 | 1 | 9 | 4096 | 4096 |
 | 64 | TiledPacked | 10 | 0.671 | 1 | 9 | 16384 | 20480 |
@@ -92,29 +131,25 @@ Combined: kernel + pool interaction (forward matmul + seeded backward; scheduler
 | 256 | TiledPacked | 3 | 12.174 | 1 | 2 | 262144 | 348160 |
 | 512 | TiledPacked | 1 | 118.022 | 1 | 0 | 1048576 | 1396736 |
 
-## 6. Key Insights
-
-- Packed+SIMD dominates once sizes are non-trivial: 9.04x vs Naive at 64, and 2.69x at 512.
-- Tiled is close to Naive at 64/128 but scales better at 256/512 (1.47–1.66x vs Naive).
-- MP/Strassen-form blocks are not a win here: slower than Packed+SIMD at every tested size; only modestly faster than Naive at 256/512.
-- Pooling removes most per-step grad allocations on fixed-shape workloads (30 → 3 allocs, 27 reuses here).
-- The scheduler is intentionally heuristic: at size 32, it selected Naive while Packed+SIMD was the measured winner; thresholds are configurable.
-
-## 7. How to Run
+## run it
 
 ```bash
 cargo run --release
 ```
 
-Useful knobs (env):
+optional knobs:
 
-- Select kernel: `POOLGRAD_FORCE_KERNEL=Naive|Tiled|TiledPacked|TiledMP`
-- Parallelism: `POOLGRAD_PAR=0|1`, `POOLGRAD_PAR_MIN_ELEMS=<usize>`
-- MP gating: `POOLGRAD_MP_MAX_SIZE=<usize>`
-- Bench stability: `POOLGRAD_BENCH_WARMUP=<usize>`, `POOLGRAD_BENCH_TRIALS=<usize>`
-- Packed microkernel: `POOLGRAD_MICROKERNEL=scalar|neon|avx2`
+```bash
+POOLGRAD_FORCE_KERNEL=TiledPacked
+POOLGRAD_PAR=1
+POOLGRAD_MP_MAX_SIZE=512
+POOLGRAD_BENCH_WARMUP=2
+POOLGRAD_BENCH_TRIALS=9
+```
 
-## 8. Notes
+## notes
 
-- CPU-only; packed microkernel uses runtime feature detection (NEON on AArch64, AVX2+FMA on x86_64 when available).
-- `TiledMP` implements a single-level Strassen-form transform over 2×2 sub-blocks; it trades extra adds for fewer multiplies and slightly higher numerical error when enabled for larger sizes.
+* cpu only
+* simd via neon (arm64) / avx2+fma (x86_64) when available
+* mp is experimental — included to explore compute vs overhead tradeoffs (and has slightly higher fp error when enabled at larger sizes)
+* code is intentionally small and explicit
