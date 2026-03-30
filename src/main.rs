@@ -247,7 +247,10 @@ fn validate_kernels() {
     let mut rng = XorShift64::new(seed);
     let sizes = [1usize, 2, 3, 4, 5, 8, 16, 31, 32, 63, 64, 96, 128, 256];
 
-    println!("\nCorrectness validation (seed={:#x}, tol=1e-4)", seed);
+    println!(
+        "\nCorrectness validation (seed={:#x}; tol: 1e-4 (Tiled/TiledPacked), 1e-3 (TiledMP))",
+        seed
+    );
     println!("Size | Kernel  | MaxAbsErr");
     println!("-----|---------|----------");
 
@@ -264,13 +267,18 @@ fn validate_kernels() {
         ] {
             let out = matmul_by_kernel(&a, &b, kernel);
             let err = max_abs_diff(&reference.data, &out.data);
+            let tol = match kernel {
+                KernelType::TiledMP => 1e-3,
+                _ => 1e-4,
+            };
             println!("{:>4} | {:<7} | {:>8.2e}", size, name, err);
             assert!(
-                err < 1e-4,
-                "kernel {:?} failed validation at size {}: max_abs_err={} (tol=1e-4)",
+                err < tol,
+                "kernel {:?} failed validation at size {}: max_abs_err={} (tol={})",
                 kernel,
                 size,
-                err
+                err,
+                tol
             );
         }
     }
@@ -302,7 +310,8 @@ fn bench_ms<F: FnMut()>(mut f: F, warmup: usize, trials: usize) -> (f64, f64) {
 fn run_kernel_benchmark() {
     let seed = 0xBADC0DE_u64;
     let mut rng = XorShift64::new(seed);
-    let sizes = [16usize, 32, 64, 96, 128, 256];
+    // Keep this list in sync with the README experiment section.
+    let sizes = [32usize, 64, 128, 256, 512];
 
     let warmup = std::env::var("POOLGRAD_BENCH_WARMUP")
         .ok()
@@ -375,8 +384,8 @@ fn run_kernel_benchmark() {
         let tiled_mp_out = kernels::tiled_mp::matmul_tiled_mp(&a, &b, 16);
         let tiled_mp_err = max_abs_diff(&reference.data, &tiled_mp_out.data);
         assert!(
-            tiled_mp_err < 1e-4,
-            "TiledMP failed validation at size {}: err={}",
+            tiled_mp_err < 1e-3,
+            "TiledMP failed validation at size {}: err={} (tol=1e-3)",
             size,
             tiled_mp_err
         );
@@ -553,7 +562,8 @@ fn run_kernel_pool_interaction_experiment() -> usize {
     use kernels::selector::KernelType;
     use tensor::tensor::matmul_with_pool;
 
-    let sizes = [16usize, 32, 64, 128, 256];
+    // Keep this list in sync with the README experiment section.
+    let sizes = [32usize, 64, 128, 256, 512];
     let mut pool = MemoryPool::new();
     pool.enabled = true;
 
@@ -566,7 +576,13 @@ fn run_kernel_pool_interaction_experiment() -> usize {
     let mut exp_peak = 0usize;
 
     for &size in &sizes {
-        let iters = if size <= 128 { 10usize } else { 3usize };
+        let iters = if size <= 128 {
+            10usize
+        } else if size <= 256 {
+            3usize
+        } else {
+            1usize
+        };
         let kernel: KernelType = select_kernel_mm(size, size, size);
 
         let alloc0 = pool.allocations;

@@ -1,97 +1,120 @@
 # PoolGrad
 
-PoolGrad is a small Rust autograd + kernel playground that focuses on **measurable systems behavior**: memory reuse via a pool, explicit backward seeding, and CPU matmul kernels with a simple scheduler.
+PoolGrad is a memory-aware ML runtime in Rust designed to study compute–memory tradeoffs in CPU matmul kernels and reverse-mode autograd.
 
-## Quickstart
+## 2. What It Is
 
-- Run everything (training + correctness validation + kernel/step benches):
+Single-binary research playground with:
+
+- `Tensor` + `TensorStore` and a minimal reverse-mode tape (`Graph`)
+- a shape-aware matmul kernel selector
+- a size-classed gradient `MemoryPool`
+- a lifetime planner that releases intermediate grads early
+
+## 3. System Overview
+
+Ops append nodes to a `Graph`; backward walks the tape in reverse and dispatches matmul gradients through the same kernel selector. Intermediate gradient buffers are returned to the pool when their last use passes.
+
+```latex
+\begin{tikzpicture}
+\node (tensor) {Tensor + Store};
+\node (graph) [right=of tensor] {Graph (tape)};
+\node (sched) [right=of graph] {Kernel Selector};
+\node (kernel) [right=of sched] {MatMul Kernels};
+\node (mem) [below=of kernel] {MemoryPool};
+\node (plan) [below=of graph] {Lifetime Planner};
+
+\draw[->] (tensor) -- (graph);
+\draw[->] (graph) -- (sched);
+\draw[->] (sched) -- (kernel);
+\draw[->] (kernel) -- (mem);
+\draw[->] (graph) -- (plan);
+\draw[->] (plan) -- (mem);
+\end{tikzpicture}
+```
+
+## 4. Key Components
+
+- Autograd: reverse-mode tape over `Operation::{Add, Mul, MatMul, ReLU, MSE}` ([src/autograd/graph.rs](src/autograd/graph.rs)).
+- Kernels: `KernelType::{Naive, Tiled, TiledPacked, TiledMP}` with optional Rayon parallelism ([src/kernels](src/kernels)).
+- Memory Pool: size-keyed free lists of `Vec<f32>` with alloc/reuse + peak tracking ([src/mem/pool.rs](src/mem/pool.rs)).
+- Scheduler: shape-aware selection with env overrides (`POOLGRAD_FORCE_KERNEL`, `POOLGRAD_SCHED_*`) ([src/kernels/selector.rs](src/kernels/selector.rs)).
+
+## 5. Experiments
+
+Bench environment:
+
+- Apple M4 (arm64, 10 cores), macOS; rustc 1.93.1
+- `cargo run --release`
+- `POOLGRAD_BENCH_WARMUP=2`, `POOLGRAD_BENCH_TRIALS=9`, `POOLGRAD_MP_MAX_SIZE=512`
+
+Kernel performance (square GEMM, median over trials; speedup vs Naive):
+
+| Size | Kernel | Time (ms, median) | Speedup vs Naive |
+|---:|---|---:|---:|
+| 32 | Naive | 0.028 | 1.00 |
+| 32 | Tiled | 0.026 | 1.08 |
+| 32 | Packed+SIMD | 0.026 | 1.08 |
+| 32 | MP | 0.034 | 0.82 |
+| 64 | Naive | 0.208 | 1.00 |
+| 64 | Tiled | 0.206 | 1.01 |
+| 64 | Packed+SIMD | 0.023 | 9.04 |
+| 64 | MP | 0.236 | 0.88 |
+| 128 | Naive | 0.310 | 1.00 |
+| 128 | Tiled | 0.298 | 1.04 |
+| 128 | Packed+SIMD | 0.156 | 1.99 |
+| 128 | MP | 0.363 | 0.85 |
+| 256 | Naive | 2.115 | 1.00 |
+| 256 | Tiled | 1.443 | 1.47 |
+| 256 | Packed+SIMD | 0.902 | 2.34 |
+| 256 | MP | 1.774 | 1.19 |
+| 512 | Naive | 15.198 | 1.00 |
+| 512 | Tiled | 9.163 | 1.66 |
+| 512 | Packed+SIMD | 5.649 | 2.69 |
+| 512 | MP | 12.657 | 1.20 |
+
+Memory pooling (training loop, pool OFF vs ON):
+
+| Mode | Alloc | Reuse | Peak (bytes) |
+|---|---:|---:|---:|
+| Baseline (pool OFF) | 30 | 0 | 28 |
+| Pooled (pool ON) | 3 | 27 | 28 |
+
+Allocation reduction vs baseline: 90.00%
+
+Combined: kernel + pool interaction (forward matmul + seeded backward; scheduler-selected kernel; one pool reused across sizes):
+
+| Size | Kernel | Iters | Time (ms) | Alloc | Reuse | LivePeak (bytes) | ResidentPeak (bytes) |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 32 | Naive | 10 | 0.305 | 1 | 9 | 4096 | 4096 |
+| 64 | TiledPacked | 10 | 0.671 | 1 | 9 | 16384 | 20480 |
+| 128 | TiledPacked | 10 | 4.931 | 1 | 9 | 65536 | 86016 |
+| 256 | TiledPacked | 3 | 12.174 | 1 | 2 | 262144 | 348160 |
+| 512 | TiledPacked | 1 | 118.022 | 1 | 0 | 1048576 | 1396736 |
+
+## 6. Key Insights
+
+- Packed+SIMD dominates once sizes are non-trivial: 9.04x vs Naive at 64, and 2.69x at 512.
+- Tiled is close to Naive at 64/128 but scales better at 256/512 (1.47–1.66x vs Naive).
+- MP/Strassen-form blocks are not a win here: slower than Packed+SIMD at every tested size; only modestly faster than Naive at 256/512.
+- Pooling removes most per-step grad allocations on fixed-shape workloads (30 → 3 allocs, 27 reuses here).
+- The scheduler is intentionally heuristic: at size 32, it selected Naive while Packed+SIMD was the measured winner; thresholds are configurable.
+
+## 7. How to Run
 
 ```bash
 cargo run --release
 ```
 
-- Faster sanity run (fewer benchmark trials):
+Useful knobs (env):
 
-```bash
-POOLGRAD_BENCH_WARMUP=1 POOLGRAD_BENCH_TRIALS=3 cargo run --release
-```
+- Select kernel: `POOLGRAD_FORCE_KERNEL=Naive|Tiled|TiledPacked|TiledMP`
+- Parallelism: `POOLGRAD_PAR=0|1`, `POOLGRAD_PAR_MIN_ELEMS=<usize>`
+- MP gating: `POOLGRAD_MP_MAX_SIZE=<usize>`
+- Bench stability: `POOLGRAD_BENCH_WARMUP=<usize>`, `POOLGRAD_BENCH_TRIALS=<usize>`
+- Packed microkernel: `POOLGRAD_MICROKERNEL=scalar|neon|avx2`
 
-## Kernels
+## 8. Notes
 
-The scheduler exposes these `KernelType`s:
-
-- `Naive`: straightforward triple loop (optionally parallel over rows)
-- `Tiled`: scalar blocked matmul (cache-friendly baseline)
-- `TiledPacked`: **packed-B panel + small microkernel** (SIMD when available)
-- `TiledMP`: experimental MP/Strassen-style block transform (falls back to tiled style on edges)
-
-### Packed + SIMD (`TiledPacked`)
-
-`TiledPacked` improves locality by packing B into contiguous panels and then applying a small register-level microkernel:
-
-- AArch64: NEON 4×4 microkernel (runtime selected)
-- x86_64: AVX2+FMA 4×8 microkernel (runtime selected)
-- Fallback: scalar 4×4 microkernel
-
-The packed path is used for sufficiently large problems to amortize packing overhead.
-
-## Benchmark output
-
-`cargo run --release` prints:
-
-- Correctness validation table (max abs error vs naive)
-- Kernel benchmark table with `median` and `p95` for:
-  - `Naive`, `Tiled`, `TiledPacked`, `TiledMP`
-- Forward+Backward step benchmark (forward matmul + backward gradients)
-- Kernel+Pool interaction experiment (scheduler choice + pool reuse metrics)
-
-## Configuration (env)
-
-### Parallelism
-
-- `POOLGRAD_PAR=1|0` (default `1`)
-- `POOLGRAD_PAR_MIN_ELEMS=<usize>` (default `16384`)
-
-### MP kernel gating
-
-- `POOLGRAD_MP_MAX_SIZE=<usize>` (default `128`)
-  - If `max(m, n, p)` exceeds this, MP/Strassen-style transforms are skipped (the MP kernel falls back to tiled style, and the scheduler will not select MP).
-
-### Bench harness
-
-- `POOLGRAD_BENCH_WARMUP=<usize>` (default `2`)
-- `POOLGRAD_BENCH_TRIALS=<usize>` (default `9`)
-
-### Scheduler thresholds
-
-- `POOLGRAD_SCHED_NAIVE_MAX=<usize>`
-- `POOLGRAD_SCHED_TILED_MAX=<usize>`
-- `POOLGRAD_SCHED_PACKED_MAX=<usize>`
-
-Additional (shape-aware) heuristics:
-
-- `POOLGRAD_SCHED_TINY_WORK_MAX=<usize>` (default `262144`)
-- `POOLGRAD_SCHED_INNER_SMALL_MAX=<usize>` (default `32`)
-
-The defaults are tuned to prefer `Naive` only for small sizes and move to `TiledPacked` for larger sizes.
-
-### Logging
-
-- `POOLGRAD_VERBOSE=1` prints per-epoch loss/output (and lifetime debug on the final epoch).
-
-### Forcing kernel / microkernel
-
-- `POOLGRAD_FORCE_KERNEL=Naive|Tiled|TiledPacked|TiledMP`
-  - Overrides the scheduler (takes precedence over `POOLGRAD_KERNEL_PROFILE`).
-- `POOLGRAD_MICROKERNEL=scalar|neon|avx2`
-  - Forces the packed microkernel choice (falls back to scalar if unsupported on the current CPU).
-
-### Kernel profiling override
-
-- `POOLGRAD_KERNEL_PROFILE=<path>`: read a simple `size -> kernel` mapping
-- `POOLGRAD_KERNEL_PROFILE_WRITE=<path>`: write the observed winners from the kernel benchmark table
-
-## Notes on reproducibility
-
-- The benchmark harness uses fixed RNG seeds for matrix generation.
-- SIMD selection is runtime-dependent on CPU features; for stricter cross-machine comparability, either force a microkernel via `POOLGRAD_MICROKERNEL=scalar` or record machine/CPU details and keep the same build flags.
+- CPU-only; packed microkernel uses runtime feature detection (NEON on AArch64, AVX2+FMA on x86_64 when available).
+- `TiledMP` implements a single-level Strassen-form transform over 2×2 sub-blocks; it trades extra adds for fewer multiplies and slightly higher numerical error when enabled for larger sizes.
