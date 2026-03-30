@@ -1,5 +1,9 @@
 # poolgrad
 
+<p align="center">
+	<img src="bin/image.jpg" width="520" alt="poolgrad overview" />
+</p>
+
 a tiny ML runtime in rust (with a bit of systems bite).
 
 it builds a minimal autograd engine, a few matrix multiplication kernels, and a small memory system — just enough to explore where performance actually comes from.
@@ -46,18 +50,10 @@ kernels are shared between forward and backward.
 
 gradients are reused instead of reallocated (and released early when the planner says they’re dead).
 
-```latex
-\begin{tikzpicture}
-\node (t) {tensor};
-\node (g) [right=of t] {graph};
-\node (k) [right=of g] {kernels};
-\node (m) [below=of k] {memory pool};
 
-\draw[->] (t) -- (g);
-\draw[->] (g) -- (k);
-\draw[->] (k) -- (m);
-\end{tikzpicture}
-```
+<p align="center">
+	<img src="bin/poolgrad.svg" width="520" alt="poolgrad overview" />
+</p>
 
 ---
 
