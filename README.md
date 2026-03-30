@@ -1,7 +1,7 @@
 # poolgrad
 
 <p align="center">
-	<img src="bin/image.jpg" width="520" alt="poolgrad overview" />
+	<img src="bin/image.jpg" width="1000" alt="poolgrad overview" />
 </p>
 
 a tiny ML runtime in rust (with a bit of systems bite).
