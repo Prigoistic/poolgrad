@@ -6,6 +6,8 @@ it builds a minimal autograd engine, a few matrix multiplication kernels, and a 
 
 this is not a framework. it’s a playground.
 
+---
+
 ## what is this?
 
 poolgrad is a single-binary runtime that implements:
@@ -15,16 +17,11 @@ poolgrad is a single-binary runtime that implements:
 * a simple kernel scheduler
 * a gradient memory pool + lifetime-based release
 
-core autograd, kernels, pooling, and scheduling are handwritten; rayon is used for parallel loops.
+everything is explicit. no hidden magic.
 
-code map:
+the only dependency is rayon (for parallel loops).
 
-* autograd: [src/autograd/graph.rs](src/autograd/graph.rs)
-* kernels + scheduler: [src/kernels/selector.rs](src/kernels/selector.rs)
-* packed microkernel + tiling: [src/kernels/tiled.rs](src/kernels/tiled.rs)
-* mp transform: [src/kernels/mp.rs](src/kernels/mp.rs)
-* memory pool: [src/mem/pool.rs](src/mem/pool.rs)
-* lifetime planner: [src/planner/lifetime.rs](src/planner/lifetime.rs)
+---
 
 ## why?
 
@@ -38,6 +35,8 @@ this project asks:
 * better memory access?
 * vector instructions?
 * less allocation?
+
+---
 
 ## a quick look
 
@@ -60,6 +59,8 @@ gradients are reused instead of reallocated (and released early when the planner
 \end{tikzpicture}
 ```
 
+---
+
 ## the interesting part
 
 there are four ways to multiply matrices here:
@@ -74,6 +75,8 @@ the mp idea is simple:
 > can we compute the same result with fewer multiplications?
 
 it’s strassen-like in spirit, but not recursive: it’s applied at block granularity.
+
+---
 
 ## what happens
 
@@ -105,6 +108,8 @@ packed+simd      5.6 ms
 mp              12.7 ms
 ```
 
+---
+
 ## memory
 
 gradients are reused via a simple size-based pool.
@@ -131,6 +136,8 @@ kernel + pool interaction (forward matmul + seeded backward; scheduler-selected 
 | 256 | TiledPacked | 3 | 12.174 | 1 | 2 | 262144 | 348160 |
 | 512 | TiledPacked | 1 | 118.022 | 1 | 0 | 1048576 | 1396736 |
 
+---
+
 ## run it
 
 ```bash
@@ -146,6 +153,8 @@ POOLGRAD_MP_MAX_SIZE=512
 POOLGRAD_BENCH_WARMUP=2
 POOLGRAD_BENCH_TRIALS=9
 ```
+
+---
 
 ## notes
 
