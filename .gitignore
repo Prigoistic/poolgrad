@@ -22,5 +22,8 @@
 # Logs
 *.log
 
+# Notebook artifacts
+poolgrad_stdout.txt
+
 # Misc
 **/*.rs.bk
