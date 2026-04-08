@@ -1,5 +1,6 @@
 use crate::autograd::node::{Node, Operation};
-use crate::mem::pool::MemoryPool;
+use crate::memory::pool::MemoryPool;
+use crate::planner::grad_planner::GradPlanner;
 use crate::tensor::store::TensorStore;
 
 use crate::kernels::selector::{
@@ -8,6 +9,112 @@ use crate::kernels::selector::{
 };
 
 use std::collections::HashMap;
+
+trait GradAllocator {
+    fn ensure_grad(&mut self, store: &mut TensorStore, id: usize);
+    fn seed_grad(&mut self, store: &mut TensorStore, id: usize, seed: &[f32]);
+    fn release_if_intermediate(&mut self, store: &mut TensorStore, id: usize);
+}
+
+struct PoolGradAllocator<'a> {
+    pool: &'a mut MemoryPool,
+}
+
+impl<'a> GradAllocator for PoolGradAllocator<'a> {
+    #[inline]
+    fn ensure_grad(&mut self, store: &mut TensorStore, id: usize) {
+        let t = store.get_mut(id);
+        if !t.requires_grad {
+            return;
+        }
+
+        if t.grad.is_empty() {
+            t.grad = self.pool.get(t.data.len());
+        } else {
+            debug_assert_eq!(
+                t.grad.len(),
+                t.data.len(),
+                "Tensor {}: grad len != data len",
+                id
+            );
+        }
+    }
+
+    #[inline]
+    fn seed_grad(&mut self, store: &mut TensorStore, id: usize, seed: &[f32]) {
+        self.ensure_grad(store, id);
+        let t = store.get_mut(id);
+        if !t.requires_grad {
+            return;
+        }
+        assert_eq!(
+            t.data.len(),
+            seed.len(),
+            "seed length must match tensor size"
+        );
+        assert_eq!(t.grad.len(), seed.len(), "missing/invalid grad buffer");
+        t.grad.copy_from_slice(seed);
+    }
+
+    #[inline]
+    fn release_if_intermediate(&mut self, store: &mut TensorStore, id: usize) {
+        let t = store.get_mut(id);
+        if t.creator.is_some() && !t.grad.is_empty() {
+            self.pool.release(std::mem::take(&mut t.grad));
+        }
+    }
+}
+
+struct PlannedGradAllocator {
+    planner: GradPlanner,
+}
+
+impl PlannedGradAllocator {
+    fn new(planner: GradPlanner) -> Self {
+        Self { planner }
+    }
+}
+
+impl GradAllocator for PlannedGradAllocator {
+    #[inline]
+    fn ensure_grad(&mut self, store: &mut TensorStore, id: usize) {
+        let t = store.get_mut(id);
+        if !t.requires_grad {
+            return;
+        }
+        if t.grad.is_empty() {
+            let len = t.data.len();
+            t.grad = self.planner.checkout(id, len);
+        } else {
+            debug_assert_eq!(t.grad.len(), t.data.len());
+        }
+    }
+
+    #[inline]
+    fn seed_grad(&mut self, store: &mut TensorStore, id: usize, seed: &[f32]) {
+        self.ensure_grad(store, id);
+        let t = store.get_mut(id);
+        if !t.requires_grad {
+            return;
+        }
+        assert_eq!(
+            t.data.len(),
+            seed.len(),
+            "seed length must match tensor size"
+        );
+        assert_eq!(t.grad.len(), seed.len(), "missing/invalid grad buffer");
+        t.grad.copy_from_slice(seed);
+    }
+
+    #[inline]
+    fn release_if_intermediate(&mut self, store: &mut TensorStore, id: usize) {
+        let t = store.get_mut(id);
+        if t.creator.is_some() && !t.grad.is_empty() {
+            let buf = std::mem::take(&mut t.grad);
+            self.planner.checkin(id, buf);
+        }
+    }
+}
 
 /// A minimal reverse-mode autograd tape.
 ///
@@ -28,23 +135,21 @@ impl Graph {
     }
 
     pub fn backward(&self, store: &mut TensorStore, loss_id: usize, pool: &mut MemoryPool) {
-        self.ensure_grad_buffers_for_graph(store, loss_id, pool);
-
         // Contract: `backward(loss_id)` seeds scalar loss with 1.0.
         // For non-scalar outputs, use `backward_seeded`.
-        {
-            let loss = store.get_mut(loss_id);
-            if loss.requires_grad {
-                assert_eq!(
-                    loss.grad.len(),
-                    1,
-                    "Graph::backward(loss_id): loss must be scalar; use backward_seeded for non-scalar"
-                );
-                loss.grad[0] = 1.0;
-            }
+        let mut alloc = PoolGradAllocator { pool };
+
+        if store.get(loss_id).requires_grad {
+            assert_eq!(
+                store.get(loss_id).data.len(),
+                1,
+                "Graph::backward(loss_id): loss must be scalar; use backward_seeded for non-scalar"
+            );
+            alloc.seed_grad(store, loss_id, &[1.0]);
         }
 
-        self.backward_internal(store, loss_id);
+        self.backward_internal(store, loss_id, &mut alloc);
+        alloc.release_if_intermediate(store, loss_id);
     }
 
     pub fn backward_seeded(
@@ -54,73 +159,62 @@ impl Graph {
         seed: &[f32],
         pool: &mut MemoryPool,
     ) {
-        self.ensure_grad_buffers_for_graph(store, output_id, pool);
-
-        {
-            let out = store.get_mut(output_id);
-            if out.requires_grad {
-                assert_eq!(
-                    out.grad.len(),
-                    seed.len(),
-                    "Graph::backward_seeded: seed length must match output grad length"
-                );
-                out.grad.copy_from_slice(seed);
-            }
+        let mut alloc = PoolGradAllocator { pool };
+        if store.get(output_id).requires_grad {
+            alloc.seed_grad(store, output_id, seed);
         }
 
-        self.backward_internal(store, output_id);
+        self.backward_internal(store, output_id, &mut alloc);
+        alloc.release_if_intermediate(store, output_id);
     }
 
-    fn ensure_grad_buffers_for_graph(
+    /// Research-grade deterministic backward pass.
+    ///
+    /// This builds a backward liveness-based `GradPlanner` and uses it to allocate and
+    /// recycle gradient buffers deterministically (no `MemoryPool::get/release`).
+    pub fn backward_planned(&self, store: &mut TensorStore, loss_id: usize) -> GradPlanner {
+        if store.get(loss_id).requires_grad {
+            assert_eq!(
+                store.get(loss_id).data.len(),
+                1,
+                "Graph::backward_planned(loss_id): loss must be scalar; use backward_seeded_planned for non-scalar"
+            );
+        }
+
+        let planner = GradPlanner::build(self, store, loss_id);
+        let mut alloc = PlannedGradAllocator::new(planner);
+        if store.get(loss_id).requires_grad {
+            alloc.seed_grad(store, loss_id, &[1.0]);
+        }
+
+        self.backward_internal(store, loss_id, &mut alloc);
+        alloc.release_if_intermediate(store, loss_id);
+        alloc.planner
+    }
+
+    pub fn backward_seeded_planned(
         &self,
         store: &mut TensorStore,
         output_id: usize,
-        pool: &mut MemoryPool,
-    ) {
-        let mut touched = vec![false; store.tensors.len()];
-        if output_id < touched.len() {
-            touched[output_id] = true;
+        seed: &[f32],
+    ) -> GradPlanner {
+        let planner = GradPlanner::build(self, store, output_id);
+        let mut alloc = PlannedGradAllocator::new(planner);
+        if store.get(output_id).requires_grad {
+            alloc.seed_grad(store, output_id, seed);
         }
 
-        for node in &self.nodes {
-            if node.output < touched.len() {
-                touched[node.output] = true;
-            }
-
-            if node.input0 < touched.len() {
-                touched[node.input0] = true;
-            }
-            if let Some(id) = node.input1
-                && id < touched.len()
-            {
-                touched[id] = true;
-            }
-        }
-
-        for (id, is_touched) in touched.into_iter().enumerate() {
-            if !is_touched {
-                continue;
-            }
-
-            let t = store.get_mut(id);
-            if !t.requires_grad {
-                continue;
-            }
-
-            if t.grad.is_empty() {
-                t.grad = pool.get(t.data.len());
-            } else {
-                debug_assert_eq!(
-                    t.grad.len(),
-                    t.data.len(),
-                    "Tensor {}: grad len != data len",
-                    id
-                );
-            }
-        }
+        self.backward_internal(store, output_id, &mut alloc);
+        alloc.release_if_intermediate(store, output_id);
+        alloc.planner
     }
 
-    fn backward_internal(&self, store: &mut TensorStore, output_id: usize) {
+    fn backward_internal(
+        &self,
+        store: &mut TensorStore,
+        output_id: usize,
+        alloc: &mut dyn GradAllocator,
+    ) {
         // Track which tensors have an upstream gradient path from `output_id`.
         let mut active: Vec<bool> = vec![false; store.tensors.len()];
         if output_id < active.len() && store.get(output_id).requires_grad {
@@ -135,6 +229,9 @@ impl Graph {
             if node.output >= active.len() || !active[node.output] {
                 continue;
             }
+
+            // Ensure the upstream gradient buffer exists.
+            alloc.ensure_grad(store, node.output);
 
             match node.op {
                 Operation::Add => {
@@ -152,6 +249,13 @@ impl Graph {
                     }
                     if b_req && b_id < active.len() {
                         active[b_id] = true;
+                    }
+
+                    if a_req {
+                        alloc.ensure_grad(store, a_id);
+                    }
+                    if b_req {
+                        alloc.ensure_grad(store, b_id);
                     }
 
                     if a_id == b_id {
@@ -190,16 +294,20 @@ impl Graph {
                                 b_id
                             );
                         }
-                        debug_assert_eq!(
-                            out.grad.len(),
-                            a.grad.len(),
-                            "Add backward: grad size mismatch"
-                        );
-                        debug_assert_eq!(
-                            out.grad.len(),
-                            b.grad.len(),
-                            "Add backward: grad size mismatch"
-                        );
+                        if a_req {
+                            debug_assert_eq!(
+                                out.grad.len(),
+                                a.grad.len(),
+                                "Add backward: grad size mismatch"
+                            );
+                        }
+                        if b_req {
+                            debug_assert_eq!(
+                                out.grad.len(),
+                                b.grad.len(),
+                                "Add backward: grad size mismatch"
+                            );
+                        }
                         for i in 0..out.grad.len() {
                             if a_req {
                                 a.grad[i] += out.grad[i];
@@ -226,6 +334,13 @@ impl Graph {
                     }
                     if b_req && b_id < active.len() {
                         active[b_id] = true;
+                    }
+
+                    if a_req {
+                        alloc.ensure_grad(store, a_id);
+                    }
+                    if b_req {
+                        alloc.ensure_grad(store, b_id);
                     }
 
                     if a_id == b_id {
@@ -264,16 +379,20 @@ impl Graph {
                                 b_id
                             );
                         }
-                        debug_assert_eq!(
-                            out.grad.len(),
-                            a.grad.len(),
-                            "Mul backward: grad size mismatch"
-                        );
-                        debug_assert_eq!(
-                            out.grad.len(),
-                            b.grad.len(),
-                            "Mul backward: grad size mismatch"
-                        );
+                        if a_req {
+                            debug_assert_eq!(
+                                out.grad.len(),
+                                a.grad.len(),
+                                "Mul backward: grad size mismatch"
+                            );
+                        }
+                        if b_req {
+                            debug_assert_eq!(
+                                out.grad.len(),
+                                b.grad.len(),
+                                "Mul backward: grad size mismatch"
+                            );
+                        }
                         for i in 0..out.grad.len() {
                             if a_req {
                                 a.grad[i] += b.data[i] * out.grad[i];
@@ -300,6 +419,13 @@ impl Graph {
                     }
                     if b_req && b_id < active.len() {
                         active[b_id] = true;
+                    }
+
+                    if a_req {
+                        alloc.ensure_grad(store, a_id);
+                    }
+                    if b_req {
+                        alloc.ensure_grad(store, b_id);
                     }
 
                     // Same-id case (X @ X): dX = dC @ X^T + X^T @ dC
@@ -425,6 +551,8 @@ impl Graph {
                         active[input_id] = true;
                     }
 
+                    alloc.ensure_grad(store, input_id);
+
                     let (input, out) = store.get_mut_and_1(input_id, node.output);
                     assert_eq!(
                         input.grad.len(),
@@ -459,6 +587,13 @@ impl Graph {
                     }
                     if target_req && target_id < active.len() {
                         active[target_id] = true;
+                    }
+
+                    if pred_req {
+                        alloc.ensure_grad(store, pred_id);
+                    }
+                    if target_req {
+                        alloc.ensure_grad(store, target_id);
                     }
 
                     let (pred, target, out) = store.get2_mut_and_1(pred_id, target_id, node.output);
@@ -509,6 +644,12 @@ impl Graph {
                     }
                 }
             }
+
+            // Release intermediate output gradient buffers as soon as they are no longer needed.
+            // After a node is processed in reverse, its output grad won't be used again.
+            if node.output != output_id {
+                alloc.release_if_intermediate(store, node.output);
+            }
         }
     }
 }
@@ -516,7 +657,7 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::Graph;
-    use crate::mem::pool::MemoryPool;
+    use crate::memory::pool::MemoryPool;
     use crate::tensor::store::TensorStore;
     use crate::tensor::tensor::{Tensor, add, matmul, mul, relu};
 
@@ -558,7 +699,7 @@ mod tests {
         ));
 
         let out_id = matmul(a_id, b_id, &mut store, &mut graph);
-        let seed = vec![1.0; store.get(out_id).grad.len()];
+        let seed = vec![1.0; store.get(out_id).data.len()];
         graph.backward_seeded(&mut store, out_id, &seed, &mut pool);
 
         // With dC = ones, dA[i,k] = sum_j B[k,j]
@@ -580,7 +721,7 @@ mod tests {
         let x_id = store.add(Tensor::new(vec![-1.0, 2.0, 0.5, 0.0], vec![4], true));
         let y_id = relu(x_id, &mut store, &mut graph);
 
-        let seed = vec![1.0; store.get(y_id).grad.len()];
+        let seed = vec![1.0; store.get(y_id).data.len()];
         graph.backward_seeded(&mut store, y_id, &seed, &mut pool);
 
         // dy/dx is 0 for x<=0, 1 for x>0 (with upstream grad = 1)

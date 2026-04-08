@@ -1,51 +1,35 @@
-use crate::autograd::graph::Graph;
-use std::collections::HashMap;
+//! Backward liveness information used by the gradient buffer planner.
 
-/// Lifetime (birth/death) for a tensor id within a single `Graph`.
+/// Backward lifetime for a tensor's *gradient buffer* within a single backward pass.
 ///
-/// - `birth`: earliest node step where the tensor appears as an output.
-/// - `death`: last node step where the tensor is used as an input.
+/// Semantics are defined over the reverse traversal of the active subgraph:
 ///
-/// Used to release intermediate gradient buffers back into the `MemoryPool` once
-/// they are no longer needed.
-#[derive(Debug, Clone, Copy)]
+/// - `birth`: earliest backward step when the grad buffer must exist (first write/seed).
+/// - `last_use`: latest backward step when the grad buffer is still needed.
+///   For non-leaf intermediates, this is typically the step where its creator node consumes
+///   the upstream gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lifetime {
     pub birth: usize,
-    pub death: usize,
+    pub last_use: usize,
 }
 
-pub fn compute_lifetimes(graph: &Graph) -> HashMap<usize, Lifetime> {
-    let mut lifetimes: HashMap<usize, Lifetime> = HashMap::new();
-
-    for (step, node) in graph.nodes.iter().enumerate() {
-        // Output tensor: mark/refresh birth.
-        lifetimes
-            .entry(node.output)
-            .and_modify(|l| l.birth = l.birth.min(step))
-            .or_insert(Lifetime {
-                birth: step,
-                death: step,
-            });
-
-        // Input tensors: extend death.
-        lifetimes
-            .entry(node.input0)
-            .and_modify(|l| l.death = l.death.max(step))
-            .or_insert(Lifetime {
-                birth: 0,
-                death: step,
-            });
-
-        if let Some(input1) = node.input1 {
-            lifetimes
-                .entry(input1)
-                .and_modify(|l| l.death = l.death.max(step))
-                .or_insert(Lifetime {
-                    birth: 0,
-                    death: step,
-                });
+impl Lifetime {
+    #[inline]
+    pub fn new(step: usize) -> Self {
+        Self {
+            birth: step,
+            last_use: step,
         }
     }
 
-    lifetimes
+    #[inline]
+    pub fn update_birth(&mut self, step: usize) {
+        self.birth = self.birth.min(step);
+    }
+
+    #[inline]
+    pub fn update_last_use(&mut self, step: usize) {
+        self.last_use = self.last_use.max(step);
+    }
 }

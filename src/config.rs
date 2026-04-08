@@ -40,3 +40,42 @@ pub fn mp_max_size() -> usize {
             .unwrap_or(128)
     })
 }
+
+/// Base-case size (square) at or below which MP recursion falls back to the packed/tiled kernel.
+///
+/// Default: 64.
+pub fn mp_base_threshold() -> usize {
+    static MP_BASE: OnceLock<usize> = OnceLock::new();
+    *MP_BASE.get_or_init(|| {
+        std::env::var("POOLGRAD_MP_BASE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64)
+    })
+}
+
+/// Minimum subproblem size (square) for which MP recursion is attempted.
+///
+/// Default: 128.
+pub fn mp_recurse_min() -> usize {
+    static MP_RECURSE_MIN: OnceLock<usize> = OnceLock::new();
+    *MP_RECURSE_MIN.get_or_init(|| {
+        std::env::var("POOLGRAD_MP_RECURSE_MIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(128)
+    })
+}
+
+/// Block size used by the packed kernel inside MP base cases.
+///
+/// Default: 64.
+pub fn mp_packed_block() -> usize {
+    static MP_PACKED_BLOCK: OnceLock<usize> = OnceLock::new();
+    *MP_PACKED_BLOCK.get_or_init(|| {
+        std::env::var("POOLGRAD_MP_PACKED_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64)
+    })
+}

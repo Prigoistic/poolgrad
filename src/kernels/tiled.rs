@@ -1,4 +1,5 @@
 use crate::config::{par_min_elems, parallel_enabled};
+use crate::memory::temp::TrackedBufF32;
 use crate::tensor::tensor::Tensor;
 use rayon::prelude::*;
 use std::sync::OnceLock;
@@ -283,7 +284,7 @@ fn matmul_tiled_nn_packed_add_into(
     let rows_per_chunk = block.saturating_mul(4).max(MR).min(m).max(1);
     let chunk_elems = rows_per_chunk * p;
 
-    let mut packed_b_full = vec![0.0f32; n * nr];
+    let mut packed_b_full = TrackedBufF32::zeros(n * nr);
 
     for jj in (0..p).step_by(nr) {
         let nr_eff = (p - jj).min(nr);
@@ -488,7 +489,7 @@ fn matmul_tiled_nt_packed_add_into(
     let rows_per_chunk = block.saturating_mul(4).max(MR).min(m).max(1);
     let chunk_elems = rows_per_chunk * n;
 
-    let mut packed_b_full = vec![0.0f32; k * nr];
+    let mut packed_b_full = TrackedBufF32::zeros(k * nr);
 
     for jj in (0..n).step_by(nr) {
         let nr_eff = (n - jj).min(nr);
@@ -694,7 +695,7 @@ fn matmul_tiled_tn_packed_add_into(
     let rows_per_chunk = block.saturating_mul(4).max(MR).min(n).max(1);
     let chunk_elems = rows_per_chunk * p;
 
-    let mut packed_b = vec![0.0f32; kc_max * nr];
+    let mut packed_b = TrackedBufF32::zeros(kc_max * nr);
 
     for jj in (0..p).step_by(nr) {
         let nr_eff = (p - jj).min(nr);
@@ -716,7 +717,7 @@ fn matmul_tiled_tn_packed_add_into(
                         }
                         let bn = ((ii0 + rows_per_chunk).min(n)) - ii0;
 
-                        let mut packed_a = vec![0.0f32; MR * kc_max];
+                        let mut packed_a = TrackedBufF32::zeros(MR * kc_max);
 
                         for i_local in (0..bn).step_by(MR) {
                             let mr = (bn - i_local).min(MR);
@@ -813,7 +814,7 @@ fn matmul_tiled_tn_packed_add_into(
                         }
                     });
             } else {
-                let mut packed_a = vec![0.0f32; MR * kc_max];
+                let mut packed_a = TrackedBufF32::zeros(MR * kc_max);
                 for ii in (0..n).step_by(MR) {
                     let mr = (n - ii).min(MR);
                     if mr == MR && nr_eff == nr {
@@ -936,51 +937,69 @@ fn matmul_tiled_into_slices_scalar(
     out: &mut [f32],
     block: usize,
 ) {
-    if parallel_enabled() && m * p >= par_min_elems() && block > 0 {
-        let rows_per_chunk = block.min(m).max(1);
-        let chunk_elems = rows_per_chunk * p;
+    if m == 0 || n == 0 || p == 0 {
+        return;
+    }
 
-        out.par_chunks_mut(chunk_elems)
-            .enumerate()
-            .for_each(|(chunk_idx, out_chunk)| {
-                let ii = chunk_idx * rows_per_chunk;
-                if ii >= m {
-                    return;
-                }
+    let block = block.max(1);
 
-                let bm = ((ii + rows_per_chunk).min(m)) - ii;
+    #[inline]
+    fn compute_row_chunk(
+        a: &[f32],
+        n: usize,
+        b: &[f32],
+        p: usize,
+        out_rows: &mut [f32],
+        row0: usize,
+        block: usize,
+    ) {
+        let bm = out_rows
+            .len()
+            .checked_div(p)
+            .expect("compute_row_chunk: p must be > 0");
+        debug_assert_eq!(out_rows.len(), bm * p);
 
-                for jj in (0..p).step_by(block) {
-                    for kk in (0..n).step_by(block) {
-                        for i_local in 0..bm {
-                            let i = ii + i_local;
-                            for j in jj..(jj + block).min(p) {
-                                let out_idx = i_local * p + j;
-                                let mut sum = out_chunk[out_idx];
-                                for k in kk..(kk + block).min(n) {
-                                    sum += a[i * n + k] * b[k * p + j];
-                                }
-                                out_chunk[out_idx] = sum;
-                            }
+        let tile_p = block.min(p).max(1);
+
+        for kk in (0..n).step_by(block) {
+            let k_end = (kk + block).min(n);
+            for jj in (0..p).step_by(tile_p) {
+                let bp = (p - jj).min(tile_p);
+
+                for i_local in 0..bm {
+                    let a_row = (row0 + i_local) * n;
+                    let out_row = i_local * p;
+                    for j in jj..(jj + bp) {
+                        let out_idx = out_row + j;
+                        let mut sum = out_rows[out_idx];
+                        for k in kk..k_end {
+                            sum += a[a_row + k] * b[k * p + j];
                         }
-                    }
-                }
-            });
-    } else {
-        for ii in (0..m).step_by(block) {
-            for jj in (0..p).step_by(block) {
-                for kk in (0..n).step_by(block) {
-                    for i in ii..(ii + block).min(m) {
-                        for j in jj..(jj + block).min(p) {
-                            let mut sum = out[i * p + j];
-                            for k in kk..(kk + block).min(n) {
-                                sum += a[i * n + k] * b[k * p + j];
-                            }
-                            out[i * p + j] = sum;
-                        }
+                        out_rows[out_idx] = sum;
                     }
                 }
             }
+        }
+    }
+
+    let rows_per_chunk = block.min(m).max(1);
+    let chunk_elems = rows_per_chunk
+        .checked_mul(p)
+        .expect("matmul_tiled_into_slices_scalar: chunk size overflow");
+
+    if parallel_enabled() && m * p >= par_min_elems() {
+        // Parallelize over disjoint row-chunks. Each worker receives a unique
+        // `&mut [f32]` covering whole rows, so aliasing is impossible.
+        out.par_chunks_mut(chunk_elems)
+            .enumerate()
+            .for_each(|(chunk_idx, out_rows)| {
+                let row0 = chunk_idx * rows_per_chunk;
+                compute_row_chunk(a, n, b, p, out_rows, row0, block);
+            });
+    } else {
+        for (chunk_idx, out_rows) in out.chunks_mut(chunk_elems).enumerate() {
+            let row0 = chunk_idx * rows_per_chunk;
+            compute_row_chunk(a, n, b, p, out_rows, row0, block);
         }
     }
 }

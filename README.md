@@ -64,13 +64,15 @@ there are four ways to multiply matrices here:
 * naive loops
 * tiled (better cache use)
 * packed + simd (pack panels + microkernel; uses NEON on arm64 when available, AVX2+FMA on x86_64)
-* mp (single-level strassen-form block transform): fewer multiplies, more adds, more data movement
+* mp (recursive strassen-form block transform with a packed base case): fewer multiplies, more adds, more data movement
 
 the mp idea is simple:
 
 > can we compute the same result with fewer multiplications?
 
 it’s strassen-like in spirit, but not recursive: it’s applied at block granularity.
+
+update: the current implementation *can recurse* when profitable, and falls back to the packed kernel at the base case to keep performance stable.
 
 ---
 
@@ -110,17 +112,30 @@ mp              12.7 ms
 
 gradients are reused via a simple size-based pool.
 
+this repo reports *two* different concepts for grad memory:
+
+* **live** bytes: currently checked out / in-use
+* **reserved** bytes: memory kept around for reuse (pool resident, or planner pre-alloc)
+
 training loop (pool off vs on):
+
+note: when `pool off`, the runtime uses the deterministic planned backward pass and does not touch the pool (so pool metrics are 0).
 
 | mode | allocations | reuses | peak resident bytes |
 |---|---:|---:|---:|
-| pool off | 30 | 0 | 28 |
-| pool on | 3 | 27 | 28 |
+| pool off | 0 | 0 | 0 |
+| pool on | 6 | 27 | 72 |
 
-```text
-allocations: 30 -> 3
-reuse:        0 -> 27
-```
+forward+backward step benchmark prints a clearer breakdown:
+
+* `GradReservedBytes`:
+	* pool mode: peak resident bytes (live + cached)
+	* plan mode: bytes pre-allocated by the planner
+* `GradLiveBytes`:
+	* pool mode: peak checked-out bytes
+	* plan mode: peak bytes checked out from planned buffers
+* `ActivationBytes`: bytes reserved by forward activations (Vec capacity in `TensorStore`)
+* `TempBytes`: peak bytes tracked by instrumented temporaries (`TrackedBufF32`)
 
 kernel + pool interaction (forward matmul + seeded backward; scheduler-selected kernel; one pool reused across sizes):
 
@@ -146,6 +161,9 @@ optional knobs:
 POOLGRAD_FORCE_KERNEL=TiledPacked
 POOLGRAD_PAR=1
 POOLGRAD_MP_MAX_SIZE=512
+POOLGRAD_MP_BASE_THRESHOLD=64
+POOLGRAD_MP_RECURSE_MIN=128
+POOLGRAD_MP_PACKED_BLOCK=64
 POOLGRAD_BENCH_WARMUP=2
 POOLGRAD_BENCH_TRIALS=9
 ```

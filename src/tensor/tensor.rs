@@ -4,7 +4,7 @@ use crate::autograd::graph::Graph;
 use crate::autograd::node::{Node, Operation};
 
 use crate::kernels::selector::{matmul_into, select_kernel_mm};
-use crate::mem::pool::MemoryPool;
+use crate::memory::pool::MemoryPool;
 use crate::tensor::store::TensorStore;
 
 pub struct Tensor {
@@ -38,43 +38,11 @@ impl Tensor {
 
         assert_eq!(data.len(), size, "Shape does not match data length");
 
-        let grad = if requires_grad {
-            vec![0.0; size]
-        } else {
-            Vec::new()
-        };
+        // Grad buffers are allocated lazily during backward. This avoids allocating
+        // for tensors that end up not being on the active gradient path.
+        let grad = Vec::new();
 
         debug_assert!(requires_grad || grad.is_empty());
-        debug_assert!(!requires_grad || grad.len() == data.len());
-
-        Self {
-            id: 0,
-            data,
-            grad,
-            shape,
-            requires_grad,
-            creator: None,
-        }
-    }
-
-    pub fn new_with_pool(
-        data: Vec<f32>,
-        shape: Vec<usize>,
-        requires_grad: bool,
-        pool: &mut MemoryPool,
-    ) -> Self {
-        let size: usize = shape.iter().product();
-
-        assert_eq!(data.len(), size, "Shape does not match data length");
-
-        let grad = if requires_grad {
-            pool.get(size)
-        } else {
-            Vec::new()
-        };
-
-        debug_assert!(requires_grad || grad.is_empty());
-        debug_assert!(!requires_grad || grad.len() == data.len());
 
         Self {
             id: 0,
@@ -96,7 +64,7 @@ fn push_pointwise_binary_op(
     b_id: usize,
     store: &mut TensorStore,
     graph: &mut Graph,
-    pool: Option<&mut MemoryPool>,
+    _pool: Option<&mut MemoryPool>,
     op: Operation,
     f: impl Fn(f32, f32) -> f32,
 ) -> usize {
@@ -114,10 +82,7 @@ fn push_pointwise_binary_op(
         .collect();
 
     let requires_grad = a.requires_grad || b.requires_grad;
-    let result = match pool {
-        Some(pool) => Tensor::new_with_pool(result_data, a.shape.clone(), requires_grad, pool),
-        None => Tensor::new(result_data, a.shape.clone(), requires_grad),
-    };
+    let result = Tensor::new(result_data, a.shape.clone(), requires_grad);
 
     let out_id = store.add(result);
     let node_id = graph.add_node(Node {
@@ -211,7 +176,7 @@ pub fn matmul_with_pool(
     b_id: usize,
     store: &mut TensorStore,
     graph: &mut Graph,
-    pool: &mut MemoryPool,
+    _pool: &mut MemoryPool,
 ) -> usize {
     let a = store.get(a_id);
     let b = store.get(b_id);
@@ -231,7 +196,7 @@ pub fn matmul_with_pool(
     matmul_into(a, b, kernel, &mut result_data);
 
     let requires_grad = a.requires_grad || b.requires_grad;
-    let result_tensor = Tensor::new_with_pool(result_data, vec![m, p], requires_grad, pool);
+    let result_tensor = Tensor::new(result_data, vec![m, p], requires_grad);
 
     let out_id = store.add(result_tensor);
 

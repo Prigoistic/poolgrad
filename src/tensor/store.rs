@@ -20,10 +20,9 @@ impl TensorStore {
         );
 
         if tensor.requires_grad {
-            assert_eq!(
-                tensor.grad.len(),
-                tensor.data.len(),
-                "TensorStore::add: requires_grad=true but grad len != data len"
+            assert!(
+                tensor.grad.is_empty() || tensor.grad.len() == tensor.data.len(),
+                "TensorStore::add: requires_grad=true but grad len must be 0 or == data len"
             );
         } else {
             assert!(

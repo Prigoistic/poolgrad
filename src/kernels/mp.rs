@@ -1,10 +1,26 @@
+use crate::config::{mp_base_threshold, mp_packed_block, mp_recurse_min};
+use crate::kernels::tiled::matmul_tiled_packed_into_slices;
+use crate::memory::temp::TrackedBufF32;
+
 /// MP-inspired block-level bilinear transform.
 ///
-/// This is implemented as a single algebraic transform over 2×2 sub-blocks (Strassen form),
-/// and is *not* recursive: the inner multiplies are standard O(n^3) square matrix multiplies.
+/// This uses a Strassen-form algebraic transform over 2×2 sub-blocks and can be applied
+/// *recursively* when profitable.
+///
+/// Base case:
+/// - For small `n` (or unsupported shapes), this falls back to the packed tiled kernel
+///   (`matmul_tiled_packed_into_slices`) to keep performance stable.
+///
+/// Recursion:
+/// - Recursion is gated by `mp_base_threshold()` and `mp_recurse_min()`; below those thresholds
+///   the implementation stops recursing and uses the packed base case.
 ///
 /// The transform works for any even `block_size >= 2` by treating sub-blocks as (block/2)×(block/2)
 /// matrices.
+///
+/// Limitations:
+/// - This implementation targets square blocks and requires even `n` at each recursion level.
+/// - Transpose variants are handled elsewhere (see `tiled_mp.rs`); MP is primarily applied to NN.
 #[derive(Debug, Clone)]
 pub struct MPTransform {
     /// For each multiplication Mi, a linear combination of A quadrants.
@@ -73,16 +89,16 @@ impl MPTransform {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MPScratch {
-    buf: Vec<f32>,
+    buf: TrackedBufF32,
     block: usize,
 }
 
 impl MPScratch {
     pub fn new() -> Self {
         Self {
-            buf: Vec::new(),
+            buf: TrackedBufF32::with_capacity(0),
             block: 0,
         }
     }
@@ -182,21 +198,59 @@ fn lincomb_into(out: &mut [f32], blocks: &[&[f32]], terms: &[(usize, f32)]) {
     }
 }
 
-fn square_mul_into(n: usize, a: &[f32], b: &[f32], out: &mut [f32]) {
+#[inline]
+fn square_mul_into_base(n: usize, a: &[f32], b: &[f32], out: &mut [f32]) {
     debug_assert_eq!(a.len(), n * n);
     debug_assert_eq!(b.len(), n * n);
     debug_assert_eq!(out.len(), n * n);
 
-    // Match the reference naive accumulation order (i-j-k) for closer bitwise behavior.
+    // Base case uses the packed kernel for a real speed path.
     out.fill(0.0);
-    for i in 0..n {
-        for j in 0..n {
-            let mut sum = 0.0f64;
-            for k in 0..n {
-                sum += (a[i * n + k] as f64) * (b[k * n + j] as f64);
-            }
-            out[i * n + j] = sum as f32;
-        }
+    matmul_tiled_packed_into_slices(a, n, n, b, n, out, mp_packed_block());
+}
+
+fn square_mul_into_dispatch(
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    out: &mut [f32],
+    transform: &MPTransform,
+    depth: usize,
+) {
+    // Stability guards.
+    if n <= mp_base_threshold() || !n.is_multiple_of(2) {
+        square_mul_into_base(n, a, b, out);
+        return;
+    }
+    if n < mp_recurse_min() {
+        square_mul_into_base(n, a, b, out);
+        return;
+    }
+
+    // Recurse using the same Strassen-form MP transform.
+    out.fill(0.0);
+    let mut scratch = MPScratch::new();
+    let applied = mp_block_mul_add_depth(
+        a,
+        n,
+        0,
+        0,
+        b,
+        n,
+        0,
+        0,
+        out,
+        n,
+        0,
+        0,
+        n,
+        transform,
+        &mut scratch,
+        depth,
+    );
+    if !applied {
+        // Should only happen if guards above missed a corner case.
+        square_mul_into_base(n, a, b, out);
     }
 }
 
@@ -252,6 +306,31 @@ pub fn mp_block_mul_add(
     transform: &MPTransform,
     scratch: &mut MPScratch,
 ) -> bool {
+    mp_block_mul_add_depth(
+        a, a_ld, a_row, a_col, b, b_ld, b_row, b_col, c, c_ld, c_row, c_col, block_size, transform,
+        scratch, 0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mp_block_mul_add_depth(
+    a: &[f32],
+    a_ld: usize,
+    a_row: usize,
+    a_col: usize,
+    b: &[f32],
+    b_ld: usize,
+    b_row: usize,
+    b_col: usize,
+    c: &mut [f32],
+    c_ld: usize,
+    c_row: usize,
+    c_col: usize,
+    block_size: usize,
+    transform: &MPTransform,
+    scratch: &mut MPScratch,
+    depth: usize,
+) -> bool {
     if block_size < 2 || !block_size.is_multiple_of(2) {
         return false;
     }
@@ -298,7 +377,8 @@ pub fn mp_block_mul_add(
         lincomb_into(s.s, &a_blocks, &transform.a_terms[mi]);
         lincomb_into(s.t, &b_blocks, &transform.b_terms[mi]);
         let m_dst = &mut s.m[mi * hh..(mi + 1) * hh];
-        square_mul_into(h, s.s, s.t, m_dst);
+        // Recursively apply MP when profitable; otherwise fall back to packed kernel.
+        square_mul_into_dispatch(h, s.s, s.t, m_dst, transform, depth + 1);
     }
 
     let m_blocks: [&[f32]; 7] = [

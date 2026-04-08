@@ -1,6 +1,6 @@
 /// A fully-connected linear layer: `y = x @ W + b`.
 use crate::autograd::graph::Graph;
-use crate::mem::pool::MemoryPool;
+use crate::memory::pool::MemoryPool;
 use crate::tensor::store::TensorStore;
 use crate::tensor::tensor::{Tensor, add_with_pool, matmul_with_pool};
 
