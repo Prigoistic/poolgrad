@@ -25,5 +25,9 @@
 # Notebook artifacts
 poolgrad_stdout.txt
 
+# Generated figures and Python scripts inside demo/ (keep only the notebook)
+demo/figures/
+demo/*.py
+
 # Misc
 **/*.rs.bk
